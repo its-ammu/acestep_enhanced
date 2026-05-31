@@ -30,7 +30,7 @@ class PipelineConfig:
     # Generation parameters
     audio_cover_strength: float = 0.95
     cover_noise_strength: float = 0.15
-    guidance_scale: float = 12.0
+    guidance_scale: float = 15.0
     inference_steps: int = 65
     shift: float = 6.0
     batch_size: int = 1
@@ -41,6 +41,9 @@ class PipelineConfig:
     # Caption
     refine_caption: bool = True
 
+    # Re-arrangement (v25): generate different instruments for the cover
+    rearrange: bool = True
+
     # Quality gate
     quality_gate: bool = True
     bad_stem_action: str = "hints"  # "hints", "swap", or "keep"
@@ -49,11 +52,21 @@ class PipelineConfig:
     per_stem_mix: bool = False
 
     # Hints degradation (for semantic route)
-    hints_strength: float = 1.0  # 1.0=full (same timbre), 0.5=chords only, 0.0=no hints
+    hints_strength: float = 1.0  # 1.0=full (correct chords), 0.5=chords only, 0.0=no hints
 
     # LoRA concept slider (name or path)
     lora_path: Optional[str] = "digital-acoustic"
     lora_scale: float = 0.7
+
+    # Skip safe generation (rely on QC repaint instead)
+    skip_safe_generation: bool = False
+
+    # QC retry cap (per section)
+    max_repaint_attempts: int = 3
+
+    # Hint blending (v26): blend original hints with MIDI piano hints
+    use_hint_blending: bool = False
+    blend_factor: float = 0.5  # 0.0=original timbre, 1.0=neutral timbre
 
     # ScragVAE (improved audio fidelity)
     use_scrag_vae: bool = True
@@ -68,6 +81,8 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
     Returns:
         Path to final cover file, or None if failed.
     """
+    import time as _time
+
     from .deps import ensure_dependencies
     from .stem_separation import separate_stems
     from .audio_analysis import analyze_bpm_and_structure, analyze_key
@@ -77,6 +92,9 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
 
     ensure_dependencies(include_optional=True)
 
+    _timings = {}
+    _t_pipeline_start = _time.time()
+
     input_song = cfg.input_song
     output_dir = cfg.output_dir
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -84,11 +102,14 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
     # === STEP 1: Stem Separation ===
     logger.info("=" * 50)
     logger.info("STEP 1: Stem Separation")
+    _t0 = _time.time()
     stems = separate_stems(input_song, f"{output_dir}/stems")
+    _timings["stem_separation"] = _time.time() - _t0
 
     # === STEP 2: Metadata ===
     logger.info("=" * 50)
     logger.info("STEP 2: Metadata Detection")
+    _t0 = _time.time()
     bpm_result = analyze_bpm_and_structure(input_song)
     key = analyze_key(input_song, bass_stem_path=stems.bass)
     metadata = {
@@ -96,11 +117,13 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
         "keyscale": key,
         "timesignature": "4/4",
     }
+    _timings["metadata"] = _time.time() - _t0
     logger.info(f"BPM: {metadata['bpm']}, Key: {metadata['keyscale']}")
 
     # === STEP 3: Structure Timeline ===
     logger.info("=" * 50)
     logger.info("STEP 3: Structure Timeline")
+    _t0 = _time.time()
     timeline = generate_structure_timeline(
         audio_path=input_song,  # Full mix for SongFormer (needs vocals for section detection)
         metadata=metadata,
@@ -110,7 +133,9 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
             "bass": stems.bass,
             "other": stems.other,
         },
+        rearrange=cfg.rearrange,
     )
+    _timings["structure_timeline"] = _time.time() - _t0
     logger.info(f"Caption: {timeline.caption[:150]}")
 
     # === STEP 4: Cover Generation ===
@@ -118,6 +143,7 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
     logger.info("STEP 4: Cover Generation")
 
     instrumental_path = None
+    _qc_section_log = []
 
     if cfg.generation_mode == "semantic":
         # Semantic generation with section-level QC:
@@ -143,7 +169,17 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
             _load_scrag_vae(handler)
 
         # Extract hints BEFORE LoRA (LoRA backup uses GPU memory during load)
-        hints = extract_semantic_hints(handler, str(stems.bass))
+        hints_stem_path = stems.bass
+
+        if cfg.use_hint_blending:
+            hints = _run_hint_blending(handler, hints_stem_path, output_dir, cfg)
+        else:
+            # Hardcode bass stem for hints — proven to give best chord accuracy.
+            # Auto-selector experiments showed "other" stem causes chord drift
+            # even when it scores higher on simplicity metrics.
+            logger.info(f"Hints source: bass ({hints_stem_path})")
+            hints = extract_semantic_hints(handler, str(hints_stem_path))
+
         if cfg.hints_strength < 1.0:
             hints = _degrade_hints(hints, strength=cfg.hints_strength)
         logger.info(f"Hints: {hints.shape}")
@@ -189,7 +225,9 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
             metas[0]["keyscale"] = metadata["keyscale"]
 
         # Generate creative version (low cns)
+        import time as _time
         logger.info(f"Generating creative version (cns={cfg.cover_noise_strength})...")
+        _t_creative_start = _time.time()
         creative_result = handler.service_generate(
             captions=timeline.caption,
             lyrics=timeline.lyrics,
@@ -203,30 +241,45 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
             task_type="cover",
             infer_method="ode",
         )
+        _t_creative_end = _time.time()
+        _timings["creative_generation"] = _t_creative_end - _t_creative_start
+        logger.info(f"⏱️  Creative generation: {_timings['creative_generation']:.1f}s")
 
         # Generate safe version (higher cns for bass consistency)
-        logger.info("Generating safe version (cns=0.3)...")
-        safe_result = handler.service_generate(
-            captions=timeline.caption,
-            lyrics=timeline.lyrics,
-            target_wavs=target_wavs,
-            metas=metas,
-            audio_cover_strength=cfg.audio_cover_strength,
-            guidance_scale=cfg.guidance_scale,
-            infer_steps=cfg.inference_steps,
-            shift=cfg.shift,
-            cover_noise_strength=0.3,
-            task_type="cover",
-            infer_method="ode",
-        )
+        safe_result = None
+        if not cfg.skip_safe_generation:
+            logger.info("Generating safe version (cns=0.3)...")
+            _t_safe_start = _time.time()
+            safe_result = handler.service_generate(
+                captions=timeline.caption,
+                lyrics=timeline.lyrics,
+                target_wavs=target_wavs,
+                metas=metas,
+                audio_cover_strength=cfg.audio_cover_strength,
+                guidance_scale=cfg.guidance_scale,
+                infer_steps=cfg.inference_steps,
+                shift=cfg.shift,
+                cover_noise_strength=0.3,
+                task_type="cover",
+                infer_method="ode",
+            )
+            _t_safe_end = _time.time()
+            _timings["safe_generation"] = _t_safe_end - _t_safe_start
+            logger.info(f"⏱️  Safe generation: {_timings['safe_generation']:.1f}s")
+        else:
+            logger.info("⏭️  Skipping safe generation (skip_safe_generation=True)")
 
-        # Decode both versions
+        # Decode versions
         gen_dir = Path(f"{output_dir}/generated")
         gen_dir.mkdir(parents=True, exist_ok=True)
         creative_path = None
         safe_path = None
 
-        for label, result in [("creative", creative_result), ("safe", safe_result)]:
+        versions = [("creative", creative_result)]
+        if safe_result is not None:
+            versions.append(("safe", safe_result))
+
+        for label, result in versions:
             if "target_latents" not in result:
                 logger.warning(f"{label} generation failed")
                 continue
@@ -333,10 +386,13 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
         logger.info("STEP 5: Post-Generation QC")
 
         from .qc_retry_loop import run_qc_retry_loop
+        import time as _time
 
+        _t_qc_start = _time.time()
+        _qc_section_log = []
         try:
             # Reuse the handler from generation (still loaded with hints + LoRA)
-            fixed_path = run_qc_retry_loop(
+            fixed_path, _qc_section_log = run_qc_retry_loop(
                 handler=handler,
                 generated_audio_path=str(instrumental_path),
                 safe_audio_path=str(safe_path) if safe_path else None,
@@ -349,11 +405,16 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
                 caption=timeline.caption,
                 lyrics=timeline.lyrics,
                 hints=hints,
+                max_repaint_attempts=cfg.max_repaint_attempts,
             )
             instrumental_path = fixed_path
 
         except Exception as e:
             logger.warning(f"QC retry loop failed: {e}. Using spliced generation.")
+
+        _t_qc_end = _time.time()
+        _timings["qc_retry_loop"] = _t_qc_end - _t_qc_start
+        logger.info(f"⏱️  QC retry loop: {_timings['qc_retry_loop']:.1f}s")
 
         # NOW cleanup handler (after QC is done)
         del handler
@@ -517,7 +578,163 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
         per_stem_mix=cfg.per_stem_mix,
     )
     logger.info(f"Final cover: {final}")
+
+    # === PIPELINE SUMMARY ===
+    _timings["total"] = _time.time() - _t_pipeline_start
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("PIPELINE SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"Caption: {timeline.caption[:200]}")
+    logger.info(f"Lyrics (first 200): {timeline.lyrics[:200]}")
+    logger.info("-" * 40)
+    logger.info("⏱️  TIMINGS:")
+    for step, secs in _timings.items():
+        logger.info(f"  {step:25s} {secs:7.1f}s")
+    logger.info("-" * 40)
+
+    # QC retry per-section log
+    if _qc_section_log:
+        logger.info("QC RETRIES:")
+        for entry in _qc_section_log:
+            logger.info(
+                f"  [{entry['label']}] {entry['start']:.1f}-{entry['end']:.1f}s: "
+                f"{entry['issue']} → {entry['result']} (⏱️ {entry['time_sec']}s)"
+            )
+    else:
+        logger.info("QC RETRIES: none needed")
+
+    # Final QC snapshot on the output
+    try:
+        from .post_gen_qc import analyze_generated_audio, get_failing_sections
+        final_qc = analyze_generated_audio(
+            audio_path=str(instrumental_path),
+            bpm=metadata.get("bpm", 100),
+            key=metadata.get("keyscale", ""),
+            segments=timeline.segments,
+            original_audio_path=str(stems.instrumental),
+        )
+        failing = get_failing_sections(final_qc)
+        total_sections = len(final_qc) if final_qc else 0
+        passing = total_sections - len(failing)
+        logger.info(f"QC FINAL: {passing}/{total_sections} sections pass")
+        for sec in final_qc:
+            status = "✅" if sec.passes else "❌"
+            issues = []
+            if sec.out_of_key_bars > 0:
+                issues.append(f"out-of-key: {sec.out_of_key_bars} bars")
+            if sec.chord_mismatch_bars > 0:
+                issues.append(f"wrong chord: {sec.chord_mismatch_bars} bars")
+            if sec.bass_dropout_bars > 0:
+                issues.append(f"bass dropout: {sec.bass_dropout_bars} bars")
+            issue_str = ", ".join(issues) if issues else "clean"
+            logger.info(
+                f"  {status} [{sec.label}] {sec.start_sec:.1f}-{sec.end_sec:.1f}s: {issue_str}"
+            )
+    except Exception as e:
+        logger.warning(f"Final QC summary failed: {e}")
+
+    logger.info("-" * 40)
+    logger.info(f"Config: cns={cfg.cover_noise_strength}, hints={cfg.hints_strength}, "
+                f"blend={cfg.use_hint_blending}, guidance={cfg.guidance_scale}, "
+                f"max_retries={cfg.max_repaint_attempts}")
+    logger.info("=" * 60)
+
     return final
+
+
+def _run_hint_blending(handler, hints_stem_path: Path, output_dir: str, cfg) -> "torch.Tensor":
+    """Orchestrate hint blending: chord detection → MIDI render → blend.
+
+    Falls back to standard bass-stem hints on any failure.
+
+    Args:
+        handler: Initialized AceStepHandler.
+        hints_stem_path: Path to bass stem (chord source + fallback).
+        output_dir: Pipeline output directory.
+        cfg: PipelineConfig with blend_factor.
+
+    Returns:
+        Blended or fallback hints tensor [B, T, D].
+    """
+    import time as _time
+    import torch
+    from .semantic_cover import extract_semantic_hints
+    from .chord_detector import detect_chords
+    from .midi_renderer import render_chords_to_wav
+    from .hint_blender import extract_and_blend
+    from .blend_metadata import write_blend_metadata
+
+    _t_blend_start = _time.time()
+    logger.info("=" * 30)
+    logger.info("Hint Blending: enabled")
+
+    # Step 1: Detect chords from bass stem
+    try:
+        detection = detect_chords(hints_stem_path)
+    except Exception as e:
+        logger.warning(f"Hint blending: chord detection failed ({e}), using bass hints")
+        return extract_semantic_hints(handler, str(hints_stem_path))
+
+    # Confidence gate
+    if detection.should_skip:
+        logger.warning(
+            f"Hint blending: skipped (confidence={detection.confidence:.2f}), "
+            f"using bass hints"
+        )
+        return extract_semantic_hints(handler, str(hints_stem_path))
+
+    # Step 2: Render chords to piano WAV
+    piano_path = Path(output_dir) / "hint_blend" / "piano_chords.wav"
+    try:
+        rendered = render_chords_to_wav(
+            chords=detection.chords,
+            output_path=piano_path,
+            duration=detection.duration,
+            sample_rate=48000,
+            velocity=80,
+        )
+    except Exception as e:
+        logger.warning(f"Hint blending: MIDI rendering failed ({e}), using bass hints")
+        return extract_semantic_hints(handler, str(hints_stem_path))
+
+    if rendered is None:
+        logger.warning("Hint blending: MIDI rendering produced no output, using bass hints")
+        return extract_semantic_hints(handler, str(hints_stem_path))
+
+    # Step 3: Extract and blend hints
+    try:
+        blended = extract_and_blend(
+            handler=handler,
+            chord_source_path=hints_stem_path,
+            timbre_source_path=rendered,
+            blend_factor=cfg.blend_factor,
+        )
+    except Exception as e:
+        logger.warning(f"Hint blending: extraction/blend failed ({e}), using bass hints")
+        return extract_semantic_hints(handler, str(hints_stem_path))
+
+    # Write metadata for reproducibility
+    write_blend_metadata(
+        output_dir=Path(output_dir) / "hint_blend",
+        output_stem="cover",
+        blend_factor=cfg.blend_factor,
+        chord_confidence=detection.confidence,
+        midi_settings={
+            "sample_rate": 48000,
+            "velocity": 80,
+            "instrument": "piano",
+            "voicing": "closed_C3_C5",
+        },
+    )
+
+    logger.info(
+        f"Hint blending: success (confidence={detection.confidence:.2f}, "
+        f"factor={cfg.blend_factor}, chords={len(detection.chords)})"
+    )
+    _t_blend_end = _time.time()
+    logger.info(f"⏱️  Hint blending total: {_t_blend_end - _t_blend_start:.1f}s")
+    return blended
 
 
 def _lego_regenerate_and_mix(

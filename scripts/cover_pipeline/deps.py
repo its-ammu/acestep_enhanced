@@ -25,12 +25,16 @@ _PACKAGE_IMPORT_MAP = {
 
 # Packages with their pip install specifiers
 REQUIRED_PACKAGES = {
+    # Numpy pinned <2.0 (audio-separator/onnxruntime use removed _no_nep50_warning)
+    "numpy": "numpy>=1.24,<2.0",
     # Stem separation
     "demucs": "demucs>=4.0.0",
     # MIR analysis
     "librosa": "librosa>=0.10.0",
     "essentia": "essentia",
     "allin1": "allin1>=1.1.0",
+    # MIDI rendering for hint blending
+    "pretty_midi": "pretty_midi>=0.2.10",
     # Audio I/O (needed for torchaudio soundfile backend)
     "soundfile": "soundfile>=0.13.0",
     # Professional audio effects for mixing
@@ -104,6 +108,37 @@ def _is_package_installed(package_name: str) -> bool:
         return True
     except (ImportError, ModuleNotFoundError):
         return False
+
+
+def _ensure_triton_version() -> None:
+    """Ensure triton is pinned to a version compatible with torch 2.10.
+
+    triton 3.6+ produces garbled/garbage audio output due to incompatible
+    GPU kernel compilation with torch 2.10.0+cu128. Pin to 3.3.x which is
+    the version torch 2.10 was built against.
+    """
+    try:
+        import triton
+        version = triton.__version__
+        major_minor = tuple(int(x) for x in version.split(".")[:2])
+        if major_minor >= (3, 4):
+            logger.warning(
+                f"triton {version} detected — incompatible with torch 2.10 "
+                f"(causes garbled audio). Downgrading to 3.3.1..."
+            )
+            venv_python = Path(__file__).parent.parent.parent / ".venv" / "bin" / "python"
+            subprocess.run(
+                ["uv", "pip", "install", "--python", str(venv_python),
+                 "triton==3.3.1", "--force-reinstall"],
+                capture_output=True, text=True, timeout=120,
+            )
+            logger.info("triton downgraded to 3.3.1")
+        else:
+            logger.debug(f"triton {version} OK (compatible with torch 2.10)")
+    except ImportError:
+        pass  # triton not installed — fine for CPU-only
+    except Exception as e:
+        logger.warning(f"triton version check failed: {e}")
 
 
 def _install_package(pip_spec: str) -> bool:
@@ -401,6 +436,9 @@ def ensure_dependencies(include_optional: bool = False) -> dict:
         else:
             success = _install_special(package_name, commands)
             status["packages"][package_name] = "installed" if success else "failed"
+
+    # Pin triton to version compatible with torch 2.10 (3.6+ produces garbled audio)
+    _ensure_triton_version()
 
     # Download models
     for model_key in MODEL_REGISTRY:

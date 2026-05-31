@@ -157,7 +157,7 @@ def _repaint_solo_sections(
     Returns:
         Modified audio with solo sections repainted, or None if no change needed.
     """
-    from .latent_repaint import repaint_section_pragmatic
+    from .fast_repaint import repaint_section_fast_audio
 
     # Find instrumental/solo sections
     inst_segments = [
@@ -197,7 +197,7 @@ def _repaint_solo_sections(
             f"— repainting at cns={solo_cns}"
         )
 
-        candidate = repaint_section_pragmatic(
+        candidate = repaint_section_fast_audio(
             handler=handler,
             clean_audio=result_audio,
             start_sec=start,
@@ -247,12 +247,16 @@ def run_qc_retry_loop(
     max_repaint_attempts: int = 3,
     bass_dropout_section_threshold: int = 3,
     solo_sections: Optional[list[dict]] = None,
-) -> Path:
+) -> tuple[Path, list[dict]]:
     """Run QC on generated audio and fix failing sections/bars.
 
     Only applies repaint if the new version passes QC for that section.
     Tries up to max_repaint_attempts seeds per section; keeps original
     if no attempt produces a passing result.
+
+    Returns:
+        Tuple of (path to QC-fixed audio, list of per-section QC summaries).
+        Each summary dict has: label, start, end, issue, result, time_sec.
 
     Args:
         handler: Initialized AceStepHandler (with hints patched).
@@ -327,14 +331,15 @@ def run_qc_retry_loop(
             fixed_path = output_dir / "semantic_cover_qc_fixed.flac"
             sf.write(str(fixed_path), audio, sr)
             logger.info(f"QC fixed output (solo only): {fixed_path}")
-            return fixed_path
-        return generated_path
+            return fixed_path, []
+        return generated_path, []
 
     logger.info(f"QC: {len(failing)} sections need fixing")
 
     # Step 2: Try to fix each failing section (only apply if passes)
     sections_fixed = 0
     sections_skipped = 0
+    _qc_section_log = []
 
     for section in failing:
         total_bars = len(section.bars)
@@ -362,11 +367,13 @@ def run_qc_retry_loop(
         )
 
         # Try up to max_repaint_attempts seeds
-        from .latent_repaint import repaint_section_pragmatic
+        import time as _time_qc
+        from .fast_repaint import repaint_section_fast_audio
 
+        _t_section_start = _time_qc.time()
         fixed = False
         for attempt in range(max_repaint_attempts):
-            candidate = repaint_section_pragmatic(
+            candidate = repaint_section_fast_audio(
                 handler=handler,
                 clean_audio=audio,
                 start_sec=section.start_sec,
@@ -394,10 +401,18 @@ def run_qc_retry_loop(
             if passes:
                 audio = candidate
                 sections_fixed += 1
+                _elapsed = _time_qc.time() - _t_section_start
                 logger.info(
                     f"    ✅ Attempt {attempt + 1}/{max_repaint_attempts}: "
-                    f"section passes QC — applied"
+                    f"section passes QC — applied "
+                    f"(⏱️ {_elapsed:.1f}s)"
                 )
+                _qc_section_log.append({
+                    "label": section.label, "start": section.start_sec,
+                    "end": section.end_sec, "issue": issue_desc,
+                    "result": f"repaint_pass (attempt {attempt + 1})",
+                    "time_sec": round(_elapsed, 1),
+                })
                 fixed = True
                 break
             else:
@@ -408,6 +423,10 @@ def run_qc_retry_loop(
 
         if not fixed and safe_audio is not None:
             # Fallback: try the safe version for this section
+            logger.info(
+                f"    Trying safe fallback... "
+                f"(⏱️ repaint took {_time_qc.time() - _t_section_start:.1f}s)"
+            )
             start_sample = int(section.start_sec * sr)
             end_sample = min(int(section.end_sec * sr), len(audio), len(safe_audio))
             crossfade_samples = int(0.1 * sr)  # 100ms crossfade
@@ -449,9 +468,17 @@ def run_qc_retry_loop(
             if passes:
                 audio = candidate
                 sections_fixed += 1
+                _elapsed = _time_qc.time() - _t_section_start
                 logger.info(
-                    f"    ✅ Safe fallback: section passes QC — spliced safe version"
+                    f"    ✅ Safe fallback: section passes QC — spliced safe version "
+                    f"(⏱️ {_elapsed:.1f}s total)"
                 )
+                _qc_section_log.append({
+                    "label": section.label, "start": section.start_sec,
+                    "end": section.end_sec, "issue": issue_desc,
+                    "result": "safe_fallback_pass",
+                    "time_sec": round(_elapsed, 1),
+                })
                 fixed = True
             else:
                 logger.info(
@@ -459,10 +486,18 @@ def run_qc_retry_loop(
                 )
 
         if not fixed:
+            _elapsed = _time_qc.time() - _t_section_start
             sections_skipped += 1
+            _qc_section_log.append({
+                "label": section.label, "start": section.start_sec,
+                "end": section.end_sec, "issue": issue_desc,
+                "result": "all_failed_kept_original",
+                "time_sec": round(_elapsed, 1),
+            })
             logger.warning(
                 f"    [{section.label}] {section.start_sec:.1f}-{section.end_sec:.1f}s: "
-                f"all attempts + safe fallback failed — keeping original"
+                f"all attempts + safe fallback failed — keeping original "
+                f"(⏱️ {_elapsed:.1f}s wasted)"
             )
 
     # Save result (only if at least one section was fixed)
@@ -492,13 +527,13 @@ def run_qc_retry_loop(
                 f"QC: {len(still_failing)} sections still failing "
                 f"(kept original — no worse than before)"
             )
-        return fixed_path
+        return fixed_path, _qc_section_log
     else:
         logger.warning(
             f"QC: No sections could be fixed after {max_repaint_attempts} attempts each "
             f"— returning original (no degradation)"
         )
-        return generated_path
+        return generated_path, _qc_section_log
 
 
 def _repaint_bar(
