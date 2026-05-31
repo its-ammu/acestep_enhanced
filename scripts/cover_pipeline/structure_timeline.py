@@ -31,6 +31,7 @@ class StructureTimelineResult:
     """Result of structure timeline generation."""
 
     caption: str = ""
+    original_caption: str = ""  # Description of original instruments
     lyrics: str = ""
     segments: list[dict] = field(default_factory=list)
     hints: list[str] = field(default_factory=list)
@@ -238,6 +239,7 @@ def generate_structure_timeline(
     metadata: Optional[dict] = None,
     qwen_model: str = "Qwen/Qwen2.5-Omni-7B",
     stem_paths: Optional[dict[str, Path]] = None,
+    rearrange: bool = True,
 ) -> StructureTimelineResult:
     """Generate coordinated caption + structural lyrics.
 
@@ -247,6 +249,8 @@ def generate_structure_timeline(
         qwen_model: HuggingFace model ID for Qwen Omni.
         stem_paths: Optional dict of stem_name -> path (drums, bass, other)
                     for per-instrument caption enrichment.
+        rearrange: If True, generate a re-arrangement caption with different
+                   instruments and translate the temporal script accordingly.
 
     Returns:
         StructureTimelineResult with caption, lyrics, segments, hints.
@@ -278,20 +282,47 @@ def generate_structure_timeline(
 
     # Step 2: Qwen pass 1 — caption generation
     # Step 3: Qwen per-chunk — section annotations
-    caption, hints, vocal_profile, genres = _run_qwen_two_pass(
+    caption, hints, vocal_profile, genres, rearrangement_caption = _run_qwen_two_pass(
         audio_path, section_list_str, section_tags, metadata, qwen_model,
         filtered_segments, stem_paths,
     )
 
-    result.caption = caption
+    result.original_caption = caption
     result.hints = hints
     result.vocal_profile = vocal_profile
     result.genres = genres
 
-    # Step 4: Assemble lyrics from tags + hints
-    result.lyrics = _assemble_lyrics(section_tags, hints)
-    logger.info(f"Generated timeline:\n{result.lyrics}")
+    # Step 4: Re-arrangement (v25) — use different instruments
+    if rearrange and rearrangement_caption:
+        from .rearrangement import (
+            sanitize_rearrangement,
+            build_caption_from_instruments,
+            translate_temporal_script,
+        )
 
+        # rearrangement_caption is a tuple: (raw_for_parsing, clean_for_dit)
+        raw_caption, _ = rearrangement_caption
+
+        # Validate and sanitize instrument names (falls back to random if garbage)
+        new_instruments = sanitize_rearrangement(raw_caption)
+
+        # Build clean caption from validated instruments
+        result.caption = build_caption_from_instruments(new_instruments)
+        logger.info(f"Re-arrangement caption (DiT): {result.caption}")
+
+        # Translate temporal script with new instrument names
+        result.lyrics = translate_temporal_script(
+            section_tags, hints, new_instruments
+        )
+        logger.info(f"Translated temporal script:\n{result.lyrics}")
+    else:
+        # No re-arrangement — use original caption and hints directly
+        if rearrange:
+            logger.warning("Re-arrangement failed, using original caption")
+        result.caption = caption
+        result.lyrics = _assemble_lyrics(section_tags, hints)
+
+    logger.info(f"Generated timeline:\n{result.lyrics}")
     return result
 
 
@@ -517,13 +548,16 @@ def _run_qwen_two_pass(
         caption_prompt = (
             f"{meta_str}"
             f"{stem_context}"
-            "Write a short music production caption for this instrumental track. "
-            "Describe the instruments and their tone using comma-separated phrases. "
-            "Focus on: what instruments are playing, their tone quality (warm/bright/"
-            "gritty/smooth/compressed/open), and the overall production feel.\n"
-            "Keep it to ONE line, under 30 words. No genre labels needed.\n"
-            "Example: 'warm overdriven electric guitar, tight compressed drums, "
-            "smooth round bass, polished pop-rock production'\n"
+            "Write a music production caption describing this instrumental track. "
+            "Describe EACH instrument in a separate sentence: name the instrument, "
+            "its tone character, any effects, and playing style.\n\n"
+            "Format: One sentence per instrument. 50-80 words total. Plain text, "
+            "no genre labels.\n\n"
+            "Example: 'Overdriven electric guitar with warm crunch tone and "
+            "moderate reverb, playing power chords on the verse and palm-muted "
+            "eighth notes on the chorus. Tight compressed drums with punchy kick "
+            "and bright snare crack. Round electric bass with slight overdrive "
+            "and consistent eighth-note pattern.'\n\n"
             "Write plain text only."
         )
         caption = _qwen_infer(qwen_model_obj, processor, audio_path, caption_prompt)
@@ -678,6 +712,56 @@ def _run_qwen_two_pass(
             hints.append(hint)
             logger.info(f"  Section {i+1}/{len(section_tags)} {tag}: {hint}")
 
+        # Re-arrangement pass: generate different instruments caption
+        # Done HERE while Qwen is still loaded (avoids double-load OOM)
+        rearrangement_caption = None
+        if metadata:
+            from .rearrangement import build_rearrangement_prompt
+
+            rearrange_prompt = build_rearrangement_prompt(
+                caption, "", metadata
+            )
+            logger.info("Running re-arrangement caption pass (Qwen still loaded)...")
+            rearrangement_caption = _qwen_infer(
+                qwen_model_obj, processor, audio_path, rearrange_prompt
+            )
+            rearrangement_caption = _truncate_to_sentences(
+                rearrangement_caption, max_sentences=4
+            )
+            # Remove hallucination patterns
+            for marker in hallucination_markers:
+                if marker in rearrangement_caption:
+                    rearrangement_caption = rearrangement_caption[
+                        :rearrangement_caption.index(marker)
+                    ].rstrip(" .,;")
+                    break
+            # Clean up: remove the DRUMS:/BASS:/MELODIC: prefixes for the
+            # caption that goes to DiT (keep as natural language)
+            clean_lines = []
+            for line in rearrangement_caption.split("\n"):
+                line_s = line.strip()
+                for prefix in ("DRUMS:", "BASS:", "MELODIC:", "drums:", "bass:", "melodic:"):
+                    if line_s.startswith(prefix):
+                        line_s = line_s[len(prefix):].strip()
+                        break
+                if line_s:
+                    clean_lines.append(line_s)
+            rearrangement_caption_clean = ". ".join(clean_lines)
+            if not rearrangement_caption_clean.endswith("."):
+                rearrangement_caption_clean += "."
+
+            if len(rearrangement_caption_clean) < 20:
+                logger.warning(
+                    f"Re-arrangement caption too short: '{rearrangement_caption_clean}'"
+                )
+                rearrangement_caption = None
+            else:
+                logger.info(
+                    f"Re-arrangement caption: {rearrangement_caption_clean[:120]}..."
+                )
+                # Store both: raw (for parsing) and clean (for DiT)
+                rearrangement_caption = (rearrangement_caption, rearrangement_caption_clean)
+
     finally:
         del qwen_model_obj
         del processor
@@ -687,7 +771,7 @@ def _run_qwen_two_pass(
             torch.cuda.synchronize()
         logger.info("Qwen unloaded, GPU memory freed")
 
-    return caption, hints, "", ""
+    return caption, hints, "", "", rearrangement_caption
 
 
 def _qwen_infer(model, processor, audio_path: Path, prompt: str) -> str:
