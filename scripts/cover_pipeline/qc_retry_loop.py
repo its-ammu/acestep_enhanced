@@ -361,6 +361,12 @@ def run_qc_retry_loop(
         else:
             continue
 
+        # Boost cns for intro/outro — these sections lack bidirectional context
+        # and need stronger anchoring to source for chord accuracy
+        if section.label in ("intro", "outro"):
+            repaint_cns = max(repaint_cns, 0.35)
+            issue_desc += " [intro/outro boost: cns=0.35]"
+
         logger.info(
             f"  [{section.label}] {section.start_sec:.1f}-{section.end_sec:.1f}s: "
             f"attempting repaint ({issue_desc})"

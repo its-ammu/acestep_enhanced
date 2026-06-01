@@ -67,7 +67,9 @@ def build_rearrangement_prompt(
     vocal_profile: str,
     metadata: Optional[dict] = None,
 ) -> str:
-    """Build the Qwen prompt for re-arrangement caption generation.
+    """Build the creative Qwen prompt — just ask for instrument ideas freely.
+
+    This is Call 1 of 2: let Qwen be creative without format constraints.
 
     Args:
         original_caption: Description of original instruments.
@@ -81,26 +83,36 @@ def build_rearrangement_prompt(
     keyscale = metadata.get("keyscale", "unknown") if metadata else "unknown"
 
     prompt = (
-        "You are a music producer creating a cover version. "
-        "Choose COMPLETELY DIFFERENT instruments from the original.\n\n"
-        f"ORIGINAL: {original_caption}\n"
-        f"SONG: {bpm} BPM, key of {keyscale}\n\n"
-        "Write EXACTLY 3 lines. Each line: category, colon, instrument name "
-        "(2-3 words only). No descriptions, no parentheses, no extra text.\n\n"
-        "DRUMS: [2-3 word drum instrument]\n"
-        "BASS: [2-3 word bass instrument]\n"
-        "MELODIC: [2-3 word melodic instrument]\n\n"
-        "Examples:\n"
-        "DRUMS: Brushed Jazz Drums\n"
-        "BASS: Upright Bass\n"
-        "MELODIC: Rhodes Piano\n\n"
-        "DRUMS: Electronic Drum Machine\n"
-        "BASS: Synth Bass\n"
-        "MELODIC: Nylon Guitar\n\n"
-        "DRUMS: Orchestral Percussion\n"
-        "BASS: Fretless Bass\n"
-        "MELODIC: Vibraphone\n\n"
-        "Now write 3 lines (different from the original):"
+        f"This song has: {original_caption}\n"
+        f"It's {bpm} BPM in {keyscale}.\n\n"
+        "If you were to cover this song with COMPLETELY DIFFERENT instruments, "
+        "what would you choose? Name one drum/percussion instrument, one bass "
+        "instrument, and one melodic instrument. Just name them — be creative "
+        "and specific. Keep it short, one sentence."
+    )
+
+    return prompt
+
+
+def build_formatting_prompt(creative_response: str) -> str:
+    """Build the formatting prompt — extract structured instrument names.
+
+    This is Call 2 of 2: pure formatting, no creativity needed.
+
+    Args:
+        creative_response: Free-form text from the creative call.
+
+    Returns:
+        Prompt asking for structured extraction.
+    """
+    prompt = (
+        f"Extract the three instruments from this text:\n"
+        f'"{creative_response}"\n\n'
+        f"Write exactly 3 lines:\n"
+        f"DRUMS: [the drum/percussion instrument name, 2-3 words]\n"
+        f"BASS: [the bass instrument name, 2-3 words]\n"
+        f"MELODIC: [the melodic instrument name, 2-3 words]\n"
+        f"Nothing else."
     )
 
     return prompt

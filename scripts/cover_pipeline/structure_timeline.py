@@ -712,55 +712,49 @@ def _run_qwen_two_pass(
             hints.append(hint)
             logger.info(f"  Section {i+1}/{len(section_tags)} {tag}: {hint}")
 
-        # Re-arrangement pass: generate different instruments caption
+        # Re-arrangement pass: two-call approach
+        # Call 1: creative (free-form instrument ideas)
+        # Call 2: structured (format extraction)
         # Done HERE while Qwen is still loaded (avoids double-load OOM)
         rearrangement_caption = None
         if metadata:
-            from .rearrangement import build_rearrangement_prompt
+            from .rearrangement import build_rearrangement_prompt, build_formatting_prompt
 
-            rearrange_prompt = build_rearrangement_prompt(
-                caption, "", metadata
+            # Call 1: Creative — let Qwen freely suggest instruments
+            creative_prompt = build_rearrangement_prompt(caption, "", metadata)
+            logger.info("Re-arrangement Call 1: creative instrument suggestion...")
+            creative_response = _qwen_infer(
+                qwen_model_obj, processor, audio_path, creative_prompt
             )
-            logger.info("Running re-arrangement caption pass (Qwen still loaded)...")
-            rearrangement_caption = _qwen_infer(
-                qwen_model_obj, processor, audio_path, rearrange_prompt
-            )
-            rearrangement_caption = _truncate_to_sentences(
-                rearrangement_caption, max_sentences=4
-            )
-            # Remove hallucination patterns
+            # Truncate at first sign of degeneration
             for marker in hallucination_markers:
-                if marker in rearrangement_caption:
-                    rearrangement_caption = rearrangement_caption[
-                        :rearrangement_caption.index(marker)
+                if marker in creative_response:
+                    creative_response = creative_response[
+                        :creative_response.index(marker)
                     ].rstrip(" .,;")
                     break
-            # Clean up: remove the DRUMS:/BASS:/MELODIC: prefixes for the
-            # caption that goes to DiT (keep as natural language)
-            clean_lines = []
-            for line in rearrangement_caption.split("\n"):
-                line_s = line.strip()
-                for prefix in ("DRUMS:", "BASS:", "MELODIC:", "drums:", "bass:", "melodic:"):
-                    if line_s.startswith(prefix):
-                        line_s = line_s[len(prefix):].strip()
-                        break
-                if line_s:
-                    clean_lines.append(line_s)
-            rearrangement_caption_clean = ". ".join(clean_lines)
-            if not rearrangement_caption_clean.endswith("."):
-                rearrangement_caption_clean += "."
+            # Also truncate at repeated punctuation
+            import re as _re
+            degen_match = _re.search(r"[,.:;!?]{3,}", creative_response)
+            if degen_match:
+                creative_response = creative_response[:degen_match.start()].rstrip()
+            logger.info(f"  Creative response: {creative_response[:150]}")
 
-            if len(rearrangement_caption_clean) < 20:
-                logger.warning(
-                    f"Re-arrangement caption too short: '{rearrangement_caption_clean}'"
+            if len(creative_response) > 10:
+                # Call 2: Structured — extract instrument names
+                format_prompt = build_formatting_prompt(creative_response)
+                logger.info("Re-arrangement Call 2: structured extraction...")
+                structured_response = _qwen_infer(
+                    qwen_model_obj, processor, audio_path, format_prompt
                 )
-                rearrangement_caption = None
+                logger.info(f"  Structured response: {structured_response[:150]}")
+
+                # Store raw structured output for parsing by sanitize_rearrangement
+                rearrangement_caption = (structured_response, "")
             else:
-                logger.info(
-                    f"Re-arrangement caption: {rearrangement_caption_clean[:120]}..."
+                logger.warning(
+                    f"Re-arrangement creative response too short: '{creative_response}'"
                 )
-                # Store both: raw (for parsing) and clean (for DiT)
-                rearrangement_caption = (rearrangement_caption, rearrangement_caption_clean)
 
     finally:
         del qwen_model_obj
