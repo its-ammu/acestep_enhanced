@@ -300,15 +300,15 @@ def generate_structure_timeline(
             translate_temporal_script,
         )
 
-        # rearrangement_caption is a tuple: (raw_for_parsing, clean_for_dit)
+        # rearrangement_caption is a tuple: (raw_for_parsing, unused)
         raw_caption, _ = rearrangement_caption
 
         # Validate and sanitize instrument names (falls back to random if garbage)
         new_instruments = sanitize_rearrangement(raw_caption)
 
-        # Build clean caption from validated instruments
+        # Build caption from template (proven in v48)
         result.caption = build_caption_from_instruments(new_instruments)
-        logger.info(f"Re-arrangement caption (DiT): {result.caption}")
+        logger.info(f"Re-arrangement caption (template): {result.caption[:120]}")
 
         # Translate temporal script with new instrument names
         result.lyrics = translate_temporal_script(
@@ -712,48 +712,42 @@ def _run_qwen_two_pass(
             hints.append(hint)
             logger.info(f"  Section {i+1}/{len(section_tags)} {tag}: {hint}")
 
-        # Re-arrangement pass: two-call approach
-        # Call 1: creative (free-form instrument ideas)
-        # Call 2: structured (format extraction)
+        # Re-arrangement pass: single-call genre selection
+        # Qwen picks a genre number, we map to pre-validated instruments.
         # Done HERE while Qwen is still loaded (avoids double-load OOM)
         rearrangement_caption = None
         if metadata:
-            from .rearrangement import build_rearrangement_prompt, build_formatting_prompt
+            from .rearrangement import build_rearrangement_prompt, parse_genre_choice
 
-            # Call 1: Creative — let Qwen freely suggest instruments
-            creative_prompt = build_rearrangement_prompt(caption, "", metadata)
-            logger.info("Re-arrangement Call 1: creative instrument suggestion...")
-            creative_response = _qwen_infer(
-                qwen_model_obj, processor, audio_path, creative_prompt
+            # Single call: Qwen picks a genre number (classification task)
+            genre_prompt = build_rearrangement_prompt(caption, "", metadata)
+            logger.info("Re-arrangement: genre selection...")
+            genre_response = _qwen_infer(
+                qwen_model_obj, processor, audio_path, genre_prompt
             )
             # Truncate at first sign of degeneration
             for marker in hallucination_markers:
-                if marker in creative_response:
-                    creative_response = creative_response[
-                        :creative_response.index(marker)
+                if marker in genre_response:
+                    genre_response = genre_response[
+                        :genre_response.index(marker)
                     ].rstrip(" .,;")
                     break
-            # Also truncate at repeated punctuation
-            import re as _re
-            degen_match = _re.search(r"[,.:;!?]{3,}", creative_response)
-            if degen_match:
-                creative_response = creative_response[:degen_match.start()].rstrip()
-            logger.info(f"  Creative response: {creative_response[:150]}")
+            logger.info(f"  Genre response: {genre_response[:100]}")
 
-            if len(creative_response) > 10:
-                # Call 2: Structured — extract instrument names
-                format_prompt = build_formatting_prompt(creative_response)
-                logger.info("Re-arrangement Call 2: structured extraction...")
-                structured_response = _qwen_infer(
-                    qwen_model_obj, processor, audio_path, format_prompt
+            # Parse genre choice into instrument dict
+            instruments = parse_genre_choice(genre_response)
+            if instruments:
+                # Store as a fake "structured response" for downstream parsing
+                # Format it as DRUMS:/BASS:/MELODIC: lines
+                structured = (
+                    f"DRUMS: {instruments['drums']}\n"
+                    f"BASS: {instruments['bass']}\n"
+                    f"MELODIC: {instruments['melodic']}"
                 )
-                logger.info(f"  Structured response: {structured_response[:150]}")
-
-                # Store raw structured output for parsing by sanitize_rearrangement
-                rearrangement_caption = (structured_response, "")
+                rearrangement_caption = (structured, "")
             else:
                 logger.warning(
-                    f"Re-arrangement creative response too short: '{creative_response}'"
+                    f"Re-arrangement: could not parse genre from '{genre_response[:50]}'"
                 )
 
     finally:

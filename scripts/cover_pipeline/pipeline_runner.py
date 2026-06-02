@@ -1011,10 +1011,9 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
         torch.cuda.empty_cache()
 
     elif cfg.generation_mode == "cover_genre":
-        # Cover-mode genre shift: cover task + genre caption + native repaint.
-        # Cover mode naturally follows chords from source audio.
-        # Genre shift comes from the LM-refined caption.
-        # Native repaint fixes sections that drift.
+        # Cover-mode genre shift: cover task + genre caption + CFG.
+        # Cover mode preserves structure, CFG pushes toward genre caption.
+        # No hints — let cover mode handle chord preservation via audio_cover_strength.
         from .cover_genre import (
             refine_caption_for_genre, generate_cover_genre,
             repaint_failing_sections,
@@ -1026,7 +1025,7 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
         import numpy as np
         import time as _time
 
-        logger.info("Using cover_genre mode (cover task + genre caption + repaint)")
+        logger.info("Using cover_genre mode (cover + genre caption + CFG)")
 
         # Phase 1: LM enhances genre caption
         refined_caption = timeline.caption
@@ -1044,7 +1043,7 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
             _timings["lm_caption"] = _time.time() - _t_lm_start
             logger.info(f"⏱️  LM caption: {_timings['lm_caption']:.1f}s")
 
-        # Phase 2: Load DiT and generate cover
+        # Phase 2: Load DiT
         _t_render_start = _time.time()
         handler = AceStepHandler()
         handler.initialize_service(project_root=".", config_path=cfg.dit_model)
@@ -1063,12 +1062,11 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
                 handler.use_lora = True
                 logger.info(f"LoRA: {lora_dir} at scale {cfg.lora_scale}")
 
-        # Source audio: full instrumental (structural skeleton for cover mode)
+        # Source audio: full instrumental (structural skeleton)
         source_path = str(stems.instrumental)
         logger.info(f"Source: {source_path} (full instrumental = structural skeleton)")
 
-        # Timbre reference: generate a short clip in the target genre
-        # This tells the model what timbre/style to aim for
+        # Timbre reference (optional)
         refer_audios = None
         if cfg.use_timbre_reference:
             from .timbre_reference import generate_timbre_reference
@@ -1095,11 +1093,13 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
             else:
                 logger.warning("Timbre reference failed — caption-only timbre")
 
+        # Phase 3: Generate cover (no hints — clean cover mode)
         audio_np = generate_cover_genre(
             handler=handler,
             source_audio_path=source_path,
             caption=refined_caption,
             lyrics=timeline.lyrics,
+            hints=None,
             bpm=metadata.get("bpm"),
             keyscale=metadata.get("keyscale"),
             audio_cover_strength=cfg.audio_cover_strength,
@@ -1145,8 +1145,10 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
                         caption=refined_caption,
                         lyrics=timeline.lyrics,
                         source_audio_path=source_path,
+                        hints=None,
                         bpm=metadata.get("bpm"),
                         keyscale=metadata.get("keyscale"),
+                        audio_cover_strength=min(cfg.audio_cover_strength + 0.2, 0.9),
                         cover_noise_strength=cfg.cover_noise_strength,
                         guidance_scale=cfg.guidance_scale,
                         inference_steps=cfg.inference_steps,
