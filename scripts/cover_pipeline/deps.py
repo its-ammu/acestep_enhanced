@@ -141,6 +141,43 @@ def _ensure_triton_version() -> None:
         logger.warning(f"triton version check failed: {e}")
 
 
+def _ensure_numpy_compatibility() -> None:
+    """Ensure numpy <2.0 after all deps are installed.
+
+    Some packages (laion-clap, madmom) may pull numpy 2.x as a transitive
+    dependency, which breaks onnxruntime and audio-separator (compiled against
+    numpy 1.x C API). Force downgrade if numpy 2.x snuck in.
+    """
+    try:
+        import numpy as np
+        version = np.__version__
+        major = int(version.split(".")[0])
+        if major >= 2:
+            logger.warning(
+                f"numpy {version} detected — incompatible with onnxruntime/audio-separator. "
+                f"Downgrading to numpy<2.0..."
+            )
+            venv_python = Path(__file__).parent.parent.parent / ".venv" / "bin" / "python"
+            subprocess.run(
+                ["uv", "pip", "install", "--python", str(venv_python),
+                 "numpy>=1.24,<2.0", "--force-reinstall"],
+                capture_output=True, text=True, timeout=120,
+            )
+            # Also reinstall onnxruntime to pick up the correct numpy
+            subprocess.run(
+                ["uv", "pip", "install", "--python", str(venv_python),
+                 "onnxruntime", "--force-reinstall", "--no-cache-dir"],
+                capture_output=True, text=True, timeout=120,
+            )
+            logger.info("numpy downgraded to <2.0 and onnxruntime reinstalled")
+        else:
+            logger.debug(f"numpy {version} OK (compatible with onnxruntime)")
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"numpy compatibility check failed: {e}")
+
+
 def _install_package(pip_spec: str) -> bool:
     """Install a package via uv pip install into the project .venv."""
     logger.info(f"Installing: {pip_spec}")
@@ -439,6 +476,9 @@ def ensure_dependencies(include_optional: bool = False) -> dict:
 
     # Pin triton to version compatible with torch 2.10 (3.6+ produces garbled audio)
     _ensure_triton_version()
+
+    # Ensure numpy stays <2.0 (onnxruntime/audio-separator compiled against numpy 1.x)
+    _ensure_numpy_compatibility()
 
     # Download models
     for model_key in MODEL_REGISTRY:

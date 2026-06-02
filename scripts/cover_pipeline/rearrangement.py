@@ -26,12 +26,15 @@ _VALID_INSTRUMENTS = {
         "Brushed Jazz Drums", "Electronic Drum Machine", "Live Rock Drums",
         "Acoustic Drums", "Tight Funk Drums", "Lo-Fi Drum Machine",
         "Orchestral Percussion", "Bongo Congas", "Cajon Percussion",
+        "Punchy Electronic Drums", "Industrial Drums", "Breakbeat Drums",
+        "808 Drum Machine", "Aggressive Rock Drums", "Disco Drums",
     ],
     # Bass
     "bass": [
         "Upright Bass", "Synth Bass", "Electric Bass", "Fretless Bass",
         "Sub Bass", "Slap Bass", "Fingerpicked Bass", "Analog Bass",
-        "Moog Bass", "Acoustic Bass",
+        "Moog Bass", "Acoustic Bass", "Distorted Synth Bass",
+        "Funk Bass", "Aggressive Bass", "Wobble Bass", "Acid Bass",
     ],
     # Melodic
     "melodic": [
@@ -41,6 +44,9 @@ _VALID_INSTRUMENTS = {
         "Trumpet", "Saxophone", "Clarinet", "Violin", "Cello",
         "Flute", "Organ", "Harpsichord", "Mandolin", "Banjo",
         "Sitar", "Kalimba", "Music Box", "Harp", "Dulcimer",
+        "Analog Synth Lead", "Distorted Synth", "Electric Guitar",
+        "Overdriven Guitar", "Synth Arpeggio", "Brass Section",
+        "Screaming Synth Lead", "Wah Guitar", "Theremin",
     ],
 }
 
@@ -59,6 +65,7 @@ _ORIGINAL_INSTRUMENT_WORDS = {
     "mandolin", "banjo", "harmonica", "rhodes", "wurlitzer",
     "nylon", "steel", "distorted", "overdriven", "clean",
     "fender", "vibraphone", "marimba", "section",
+    "drums", "drum", "bass", "percussion", "kit",
 }
 
 
@@ -67,9 +74,11 @@ def build_rearrangement_prompt(
     vocal_profile: str,
     metadata: Optional[dict] = None,
 ) -> str:
-    """Build the creative Qwen prompt — just ask for instrument ideas freely.
+    """Build the creative Qwen prompt — pick a genre number from a list.
 
-    This is Call 1 of 2: let Qwen be creative without format constraints.
+    Instead of asking Qwen to name instruments (unreliable), we give it
+    numbered genre options and ask it to pick ONE number. This is a
+    classification task that Qwen handles reliably.
 
     Args:
         original_caption: Description of original instruments.
@@ -85,13 +94,177 @@ def build_rearrangement_prompt(
     prompt = (
         f"This song has: {original_caption}\n"
         f"It's {bpm} BPM in {keyscale}.\n\n"
-        "If you were to cover this song with COMPLETELY DIFFERENT instruments, "
-        "what would you choose? Name one drum/percussion instrument, one bass "
-        "instrument, and one melodic instrument. Just name them — be creative "
-        "and specific. Keep it short, one sentence."
+        "I want to remix this into a different genre. "
+        "Which of these genres would work best at this tempo "
+        "and match the song's energy? Pick ONE number:\n\n"
+        "1. Synthwave (electronic drums, analog synth bass, synth lead)\n"
+        "2. Funk (tight funk drums, slap bass, clavinet)\n"
+        "3. Industrial (aggressive electronic drums, distorted bass, distorted synth)\n"
+        "4. Neo-Soul (live drums with ghost notes, warm electric bass, rhodes piano)\n"
+        "5. Disco (disco drums, disco bass, string section)\n"
+        "6. Trip-Hop (breakbeat drums, sub bass, atmospheric synth pad)\n"
+        "7. Latin Rock (latin percussion, fingerpicked bass, nylon guitar)\n"
+        "8. Electro-Funk (808 drum machine, moog bass, vocoder synth)\n"
+        "9. Post-Punk (aggressive drums, driving bass, angular synth)\n"
+        "10. Cinematic (orchestral percussion, cello, brass section)\n\n"
+        "Reply with ONLY the number. Nothing else."
     )
 
     return prompt
+
+
+# Pre-validated genre → instrument mappings (ACE-Step renders these well)
+_GENRE_INSTRUMENT_MAP = {
+    "1": {"drums": "Electronic Drum Machine", "bass": "Analog Bass", "melodic": "Analog Synth Lead"},
+    "2": {"drums": "Tight Funk Drums", "bass": "Slap Bass", "melodic": "Rhodes Piano"},
+    "3": {"drums": "Aggressive Rock Drums", "bass": "Distorted Synth Bass", "melodic": "Distorted Synth"},
+    "4": {"drums": "Live Rock Drums", "bass": "Electric Bass", "melodic": "Rhodes Piano"},
+    "5": {"drums": "Disco Drums", "bass": "Electric Bass", "melodic": "Analog Synth Pad"},
+    "6": {"drums": "Breakbeat Drums", "bass": "Sub Bass", "melodic": "Analog Synth Pad"},
+    "7": {"drums": "Bongo Congas", "bass": "Fingerpicked Bass", "melodic": "Nylon Guitar"},
+    "8": {"drums": "808 Drum Machine", "bass": "Moog Bass", "melodic": "Analog Synth Lead"},
+    "9": {"drums": "Aggressive Rock Drums", "bass": "Electric Bass", "melodic": "Analog Synth Lead"},
+    "10": {"drums": "Orchestral Percussion", "bass": "Cello", "melodic": "Trumpet"},
+}
+
+# Genre-specific layer templates for multi-layer Lego generation
+# Each genre has 3 layers: pad (harmonic fill), lead (melody), rhythm (movement)
+_GENRE_LAYERS = {
+    "1": [  # Synthwave
+        {"track": "synth", "caption": "warm analog synth pad with lush sustained chords, slow filter sweeps, wide stereo, atmospheric"},
+        {"track": "synth", "caption": "expressive analog synth lead with dynamic melody, pitch bends, vibrato, soaring in choruses"},
+        {"track": "synth", "caption": "pulsing synth arpeggio, 16th note pattern, rhythmic and driving, sidechain pumping"},
+    ],
+    "2": [  # Funk
+        {"track": "keyboard", "caption": "rhodes piano with warm jazzy chords, rhythmic comping, ghost notes, groove-locked"},
+        {"track": "keyboard", "caption": "clavinet lead with funky stabs, wah-wah effect, syncopated rhythm, percussive attack"},
+        {"track": "brass", "caption": "tight brass stabs, syncopated hits, punchy and short, filling gaps between vocals"},
+    ],
+    "3": [  # Industrial
+        {"track": "synth", "caption": "dark distorted synth pad, heavy and aggressive, low-frequency rumble, menacing atmosphere"},
+        {"track": "synth", "caption": "screaming distorted synth lead, aggressive melody, harsh filter sweeps, intense"},
+        {"track": "synth", "caption": "glitchy rhythmic synth stabs, industrial percussion hits, mechanical and relentless"},
+    ],
+    "4": [  # Neo-Soul
+        {"track": "keyboard", "caption": "warm rhodes piano with soft jazzy chords, gentle comping, intimate and smooth"},
+        {"track": "guitar", "caption": "clean electric guitar with gentle melody, jazz voicings, subtle bends, warm tone"},
+        {"track": "strings", "caption": "soft string pad, sustained harmonies, lush and warm, background texture"},
+    ],
+    "5": [  # Disco
+        {"track": "strings", "caption": "lush disco string section, sustained chords, sweeping arrangements, orchestral"},
+        {"track": "keyboard", "caption": "funky electric piano, rhythmic chords, bright and percussive, disco groove"},
+        {"track": "guitar", "caption": "disco rhythm guitar, muted 16th note strumming, tight and funky, wah pedal"},
+    ],
+    "6": [  # Trip-Hop
+        {"track": "synth", "caption": "dark atmospheric synth pad, reverb-drenched, slow evolving texture, haunting"},
+        {"track": "keyboard", "caption": "sparse piano melody, lo-fi processed, reverb, melancholic and minimal"},
+        {"track": "synth", "caption": "subtle vinyl crackle texture with ambient noise, atmospheric background layer"},
+    ],
+    "7": [  # Latin Rock
+        {"track": "guitar", "caption": "nylon string guitar with fingerpicked arpeggios, warm and expressive, latin feel"},
+        {"track": "keyboard", "caption": "organ with sustained chords, warm tone, filling harmonic space"},
+        {"track": "percussion", "caption": "shaker and tambourine rhythm, steady 8th notes, adding movement and groove"},
+    ],
+    "8": [  # Electro-Funk
+        {"track": "synth", "caption": "thick moog synth pad, warm analog chords, funky filter modulation, groovy"},
+        {"track": "synth", "caption": "vocoder synth lead, robotic melody, funky and expressive, talk-box style"},
+        {"track": "synth", "caption": "synth arpeggio with funky rhythm, 16th note pattern, bouncy and energetic"},
+    ],
+    "9": [  # Post-Punk
+        {"track": "synth", "caption": "angular synth pad, cold and sharp, minimal chords, post-punk atmosphere"},
+        {"track": "synth", "caption": "aggressive synth lead, angular melody, sharp attack, driving and urgent"},
+        {"track": "guitar", "caption": "jangly guitar arpeggios, chorus effect, rhythmic and hypnotic, post-punk style"},
+    ],
+    "10": [  # Cinematic
+        {"track": "strings", "caption": "epic orchestral strings, sweeping sustained chords, building and dramatic"},
+        {"track": "brass", "caption": "powerful brass melody, heroic and soaring, dynamic crescendos"},
+        {"track": "percussion", "caption": "orchestral percussion hits, timpani rolls, dramatic accents, cinematic impact"},
+    ],
+}
+
+
+def get_genre_layers(genre_number: str) -> list[dict]:
+    """Get the multi-layer Lego templates for a genre.
+
+    Args:
+        genre_number: Genre number string ("1"-"10").
+
+    Returns:
+        List of layer dicts with "track" and "caption" keys.
+        Falls back to synthwave if genre not found.
+    """
+    return _GENRE_LAYERS.get(genre_number, _GENRE_LAYERS["1"])
+
+
+# Stores the last selected genre number for downstream use
+_last_genre_number: str = "1"
+
+
+def get_last_genre_number() -> str:
+    """Return the genre number from the most recent parse_genre_choice call."""
+    return _last_genre_number
+
+
+def parse_genre_choice(response: str) -> Optional[dict[str, str]]:
+    """Parse Qwen's genre response into instrument dict.
+
+    Handles both number responses ("8") and name responses ("Electro-funk").
+    Falls back to random selection if completely unparseable.
+    Also stores the genre number for downstream layer lookup.
+
+    Args:
+        response: Qwen's response (ideally a number or genre name).
+
+    Returns:
+        Instrument dict or None if unparseable.
+    """
+    global _last_genre_number
+    response_lower = response.lower().strip()
+
+    # Try number first
+    numbers = re.findall(r"\b(\d{1,2})\b", response)
+    if numbers:
+        choice = numbers[0]
+        if choice in _GENRE_INSTRUMENT_MAP:
+            _last_genre_number = choice
+            instruments = _GENRE_INSTRUMENT_MAP[choice]
+            logger.info(f"Genre choice (number): {choice} → {instruments}")
+            return instruments
+
+    # Try matching genre name keywords (longer/more specific patterns first)
+    _GENRE_NAME_MAP = [
+        ("electro-funk", "8"), ("electro funk", "8"), ("electrofunk", "8"),
+        ("synth-pop", "1"), ("synth pop", "1"), ("synthpop", "1"),
+        ("synthwave", "1"), ("synth-wave", "1"), ("synth wave", "1"),
+        ("neo-soul", "4"), ("neo soul", "4"), ("neosoul", "4"),
+        ("trip-hop", "6"), ("trip hop", "6"), ("triphop", "6"),
+        ("post-punk", "9"), ("post punk", "9"), ("postpunk", "9"),
+        ("latin rock", "7"),
+        ("industrial", "3"),
+        ("cinematic", "10"), ("orchestral", "10"),
+        ("disco", "5"),
+        ("latin", "7"),
+        ("funk", "2"), ("funky", "2"),
+    ]
+
+    for name, num in _GENRE_NAME_MAP:
+        if name in response_lower:
+            _last_genre_number = num
+            instruments = _GENRE_INSTRUMENT_MAP[num]
+            logger.info(f"Genre choice (name match '{name}'): {num} → {instruments}")
+            return instruments
+
+    # Last resort: pick a random energetic option
+    import random
+    energetic_choices = ["1", "2", "3", "8", "9"]  # Skip mellow options
+    choice = random.choice(energetic_choices)
+    _last_genre_number = choice
+    instruments = _GENRE_INSTRUMENT_MAP[choice]
+    logger.warning(
+        f"Could not parse genre from: '{response[:50]}' — "
+        f"random fallback: {choice} → {instruments}"
+    )
+    return instruments
 
 
 def build_formatting_prompt(creative_response: str) -> str:
@@ -181,8 +354,8 @@ def _is_valid_instrument(name: str, category: str) -> bool:
     if len(words) > 5:
         return False
 
-    # Reject if contains non-alpha characters (except hyphens and spaces)
-    if re.search(r"[^a-zA-Z\s\-]", name):
+    # Reject if contains non-alpha characters (except hyphens, spaces, and digits)
+    if re.search(r"[^a-zA-Z\s\-0-9]", name):
         return False
 
     # Reject if any word is too long (>15 chars = hallucination)
@@ -204,7 +377,11 @@ def _is_valid_instrument(name: str, category: str) -> bool:
 
 
 def build_caption_from_instruments(instruments: dict[str, str]) -> str:
-    """Build a clean DiT caption from validated instrument names.
+    """Build a rich DiT caption from validated instrument names.
+
+    The caption should include genre context, mood, production style,
+    AND performance instructions. ACE-Step responds to playing style
+    descriptors that tell it HOW to perform, not just WHAT instrument.
 
     Args:
         instruments: Dict with "drums", "bass", "melodic" keys.
@@ -212,14 +389,70 @@ def build_caption_from_instruments(instruments: dict[str, str]) -> str:
     Returns:
         Caption string suitable for the DiT text encoder.
     """
-    parts = []
-    if instruments.get("drums"):
-        parts.append(instruments["drums"])
-    if instruments.get("bass"):
-        parts.append(instruments["bass"])
-    if instruments.get("melodic"):
-        parts.append(instruments["melodic"])
-    return ". ".join(parts) + "."
+    drums = instruments.get("drums", "drums")
+    bass = instruments.get("bass", "bass")
+    melodic = instruments.get("melodic", "synth")
+
+    # Genre-specific performance descriptions for richer output
+    melodic_lower = melodic.lower()
+
+    # Determine performance style based on instrument type
+    if any(k in melodic_lower for k in ("synth lead", "analog synth lead")):
+        melodic_desc = (
+            f"expressive {melodic.lower()} with dynamic performance, "
+            f"rhythmic arpeggios building to soaring sustained leads, "
+            f"aggressive pitch bends and filter sweeps in solo sections"
+        )
+    elif any(k in melodic_lower for k in ("synth pad", "pad")):
+        melodic_desc = (
+            f"lush {melodic.lower()} with slow evolving textures, "
+            f"wide stereo chorusing, subtle filter movement, "
+            f"harmonic swells building through choruses"
+        )
+    elif any(k in melodic_lower for k in ("rhodes", "wurlitzer", "piano")):
+        melodic_desc = (
+            f"warm {melodic.lower()} with jazzy chord voicings, "
+            f"rhythmic comping with ghost notes in verses, "
+            f"sustained emotional chords swelling in choruses"
+        )
+    elif any(k in melodic_lower for k in ("guitar", "nylon")):
+        melodic_desc = (
+            f"expressive {melodic.lower()} with fingerpicked arpeggios "
+            f"in verses, strummed chords building in choruses, "
+            f"melodic lead lines with vibrato in instrumental sections"
+        )
+    elif any(k in melodic_lower for k in ("trumpet", "brass", "sax")):
+        melodic_desc = (
+            f"powerful {melodic.lower()} with dynamic phrasing, "
+            f"sustained melodic lines building intensity, "
+            f"punchy staccato accents and soaring legato passages"
+        )
+    elif any(k in melodic_lower for k in ("violin", "cello", "string")):
+        melodic_desc = (
+            f"sweeping {melodic.lower()} with emotional sustained lines, "
+            f"dynamic crescendos building through sections, "
+            f"pizzicato rhythmic accents alternating with legato passages"
+        )
+    elif "distorted" in melodic_lower:
+        melodic_desc = (
+            f"aggressive {melodic.lower()} with heavy distortion, "
+            f"grinding rhythmic patterns in verses, "
+            f"screaming lead lines with feedback in choruses"
+        )
+    else:
+        melodic_desc = (
+            f"expressive {melodic.lower()} with dynamic performance, "
+            f"rhythmic patterns in verses building to powerful leads "
+            f"in choruses, intense solo with pitch variation"
+        )
+
+    caption = (
+        f"{melodic_desc}. "
+        f"{drums} with tight groove and dynamic fills, "
+        f"deep {bass.lower()} locking with kick drum pattern. "
+        f"Professional production, punchy mix, wide stereo field."
+    )
+    return caption
 
 
 def _extract_short_name(raw_description: str, max_words: int = 4) -> str:
@@ -398,11 +631,11 @@ def translate_temporal_script(
     original_hints: list[str],
     new_instruments: dict[str, str],
 ) -> str:
-    """Translate temporal script hints to use re-arranged instrument names.
+    """Translate temporal script to use energy/style hints without instrument names.
 
-    Simple approach: swap instrument names, keep playing style words as-is.
-    The model interprets "Rhodes Piano Strumming" as "rhythmic chordal Rhodes"
-    which is directionally correct.
+    The caption already tells the model what instruments to use. The lyrics
+    should provide structural guidance (section boundaries) and energy/style
+    descriptors using official ACE-Step energy tags.
 
     Args:
         section_tags: Section tags from SongFormer (e.g., "[Verse 1]").
@@ -410,59 +643,74 @@ def translate_temporal_script(
         new_instruments: Dict from parse_instruments_from_caption().
 
     Returns:
-        Assembled lyrics string with new instrument names.
+        Assembled lyrics string with clean section tags and energy hints.
     """
-    melodic_name = new_instruments.get("melodic", "")
-    drums_name = new_instruments.get("drums", "Drums")
-    bass_name = new_instruments.get("bass", "Bass")
-
     lines = []
-    for tag, hint in zip(section_tags, original_hints):
+    num_sections = len(section_tags)
+
+    for idx, (tag, hint) in enumerate(zip(section_tags, original_hints)):
         if not hint or hint == "soft":
-            lines.append(tag)
+            lines.append(f"{tag[:-1]} - soft]")
             lines.append("[Instrumental]")
             lines.append("")
             continue
 
         hint_lower = hint.lower()
-        new_parts = []
 
-        # Check drums presence in original hint
-        has_drums = "drums" in hint_lower or "drum" in hint_lower
-        if has_drums:
-            new_parts.append(drums_name)
+        # Determine energy level from hint content and section position
+        energy_keywords = []
 
-        # Check bass presence in original hint
-        has_bass = "bass" in hint_lower
-        if has_bass:
-            new_parts.append(bass_name)
+        # Solo/lead detection
+        if "solo" in hint_lower or "lead" in hint_lower:
+            energy_keywords.append("explosive solo")
+        # Energy from stem analysis keywords
+        elif "peak energy" in hint_lower or "full energy" in hint_lower:
+            energy_keywords.append("high energy")
+        elif "building" in hint_lower:
+            energy_keywords.append("building energy")
+        elif "dropping" in hint_lower:
+            energy_keywords.append("fading")
+        elif "moderate energy" in hint_lower or "moderate" in hint_lower:
+            energy_keywords.append("moderate energy")
+        elif "soft" in hint_lower:
+            energy_keywords.append("soft")
+        else:
+            # Infer energy from section type and position
+            tag_lower = tag.lower()
+            if "intro" in tag_lower:
+                energy_keywords.append("building, atmospheric")
+            elif "chorus" in tag_lower:
+                # Later choruses are more intense
+                chorus_position = sum(
+                    1 for t in section_tags[:idx] if "chorus" in t.lower()
+                )
+                if chorus_position >= 3:
+                    energy_keywords.append("peak energy, anthemic")
+                elif chorus_position >= 1:
+                    energy_keywords.append("high energy, driving")
+                else:
+                    energy_keywords.append("high energy, powerful")
+            elif "verse" in tag_lower:
+                energy_keywords.append("moderate energy")
+            elif "inst" in tag_lower:
+                energy_keywords.append("intense, dynamic")
+            elif "outro" in tag_lower:
+                if idx >= num_sections - 1:
+                    energy_keywords.append("fade out")
+                else:
+                    energy_keywords.append("powerful, fading")
+            elif "bridge" in tag_lower:
+                energy_keywords.append("building energy")
 
-        # Extract melodic part: remove drums/bass words, get the rest
-        melodic_fragment = hint
-        for remove_word in ["drums", "drum", "bass"]:
-            melodic_fragment = re.sub(
-                rf"\b{remove_word}\b", "", melodic_fragment, flags=re.IGNORECASE
-            )
-        melodic_fragment = melodic_fragment.strip()
+        # Extract playing style (mutes, riff, strumming, etc.)
+        style = _extract_playing_style(hint)
+        if style and style.lower() not in ("strumming", ""):
+            energy_keywords.append(style.lower())
 
-        # If there's a melodic component, swap instrument name + keep style
-        if melodic_fragment and melodic_name:
-            style = _extract_playing_style(melodic_fragment)
-            if style:
-                new_parts.append(f"{melodic_name} {style}")
-            else:
-                new_parts.append(melodic_name)
-        elif melodic_fragment and not melodic_name:
-            # No melodic instrument parsed — keep original fragment
-            style = _extract_playing_style(melodic_fragment)
-            if style:
-                new_parts.append(style)
-
-        # Build the new hint
-        new_hint = " ".join(new_parts) if new_parts else ""
-
-        if new_hint:
-            tag_with_hint = f"{tag[:-1]} - {new_hint}]"
+        # Build tag with energy hint
+        if energy_keywords:
+            hint_str = ", ".join(energy_keywords)
+            tag_with_hint = f"{tag[:-1]} - {hint_str}]"
         else:
             tag_with_hint = tag
 

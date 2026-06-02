@@ -35,8 +35,26 @@ class PipelineConfig:
     shift: float = 6.0
     batch_size: int = 1
 
-    # Generation mode: "semantic" (bass hints) or "cli" (subprocess)
+    # Generation mode: "semantic" (bass hints), "remix_blend" (LM codes + bass blend),
+    # "lego_stems" (replace melodic only), "complete_vocals" (vocals→full backing),
+    # "complete_remix" (vocal+bass → complete task, pro remixer approach),
+    # "cover_genre" (cover task + genre caption + native repaint),
+    # "audio_codes" (5Hz loose guide), "text2music_free" (pure text), or "cli" (subprocess)
     generation_mode: str = "semantic"
+
+    # complete_remix mode settings
+    bass_mix_db: float = -6.0  # Bass level in source mix (-3=strong, -6=balanced, -12=loose)
+    refine_caption_lm: bool = True  # Use LM to enhance caption (creativity lever)
+    include_vocal_in_source: bool = True  # Include vocal in source mix (False = bass only)
+
+    # remix_blend mode settings
+    blend_alpha: float = 0.4  # 0.0=all bass chords, 1.0=all LM creativity
+    lm_model: str = "acestep-5Hz-lm-4B"  # LM for creative code planning
+    lm_temperature: float = 0.7  # LM sampling temp (0.7=conservative, 0.85=creative)
+    apply_effects: bool = True  # Post-processing production effects
+
+    # audio_codes mode settings (5Hz loose chord guidance via text2music)
+    codes_cover_strength: float = 0.3  # 0.1-0.5 for loose interpretation
 
     # Caption
     refine_caption: bool = True
@@ -70,6 +88,11 @@ class PipelineConfig:
 
     # ScragVAE (improved audio fidelity)
     use_scrag_vae: bool = True
+
+    # Timbre reference: generate a reference clip of target instruments
+    # to feed the timbre encoder (decouples timbre from semantic hints)
+    use_timbre_reference: bool = False
+    timbre_ref_duration: float = 30.0  # seconds of reference to generate
 
 
 def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
@@ -226,12 +249,42 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
 
         # Generate creative version (low cns)
         import time as _time
+
+        # Timbre reference: generate a clip of target instruments to feed
+        # the timbre encoder. This decouples timbre from the semantic hints.
+        refer_audios = None
+        if cfg.use_timbre_reference and cfg.rearrange:
+            from .timbre_reference import generate_timbre_reference
+
+            logger.info("Generating timbre reference clip...")
+            _t_ref_start = _time.time()
+            ref_audio = generate_timbre_reference(
+                handler=handler,
+                caption=timeline.caption,
+                duration=duration,
+                lyrics=timeline.lyrics,
+                bpm=metadata.get("bpm"),
+                keyscale=metadata.get("keyscale"),
+                guidance_scale=cfg.guidance_scale,
+                inference_steps=cfg.inference_steps,
+                shift=cfg.shift,
+            )
+            if ref_audio is not None:
+                refer_audios = [[ref_audio]]
+                _timings["timbre_reference"] = _time.time() - _t_ref_start
+                logger.info(
+                    f"⏱️  Timbre reference: {_timings['timbre_reference']:.1f}s"
+                )
+            else:
+                logger.warning("Timbre reference failed — using caption-only timbre")
+
         logger.info(f"Generating creative version (cns={cfg.cover_noise_strength})...")
         _t_creative_start = _time.time()
         creative_result = handler.service_generate(
             captions=timeline.caption,
             lyrics=timeline.lyrics,
             target_wavs=target_wavs,
+            refer_audios=refer_audios,
             metas=metas,
             audio_cover_strength=cfg.audio_cover_strength,
             guidance_scale=cfg.guidance_scale,
@@ -333,6 +386,907 @@ def run_pipeline(cfg: PipelineConfig) -> Optional[Path]:
             instrumental_path = safe_path
         else:
             instrumental_path = None
+    elif cfg.generation_mode == "audio_codes":
+        # Audio codes mode: extract 5Hz indices from bass stem, use as loose
+        # chord guide via text2music task. The model auto-switches to cover
+        # internally when audio_codes are provided, but uses the coarser 5Hz
+        # representation (chord-level) instead of 25Hz hints (timbre-level).
+        from .extract_audio_codes import extract_audio_codes_string
+        from acestep.handler import AceStepHandler
+        from .generate_semantic import _load_scrag_vae, ensure_slider_lora
+        import torch
+        import soundfile as sf_gen
+        import numpy as np
+        import librosa as lr
+        import time as _time
+
+        logger.info("Using audio_codes mode (5Hz loose chord guidance)")
+
+        handler = AceStepHandler()
+        handler.initialize_service(project_root=".", config_path=cfg.dit_model)
+
+        if cfg.use_scrag_vae:
+            _load_scrag_vae(handler)
+
+        # Extract 5Hz codes from bass stem (chord roots without timbre)
+        _t_codes_start = _time.time()
+        codes_string = extract_audio_codes_string(handler, str(stems.bass))
+        _timings["codes_extraction"] = _time.time() - _t_codes_start
+        logger.info(f"⏱️  Codes extraction: {_timings['codes_extraction']:.1f}s")
+
+        # Load LoRA
+        if cfg.lora_path:
+            lora_dir = Path(cfg.lora_path)
+            if not lora_dir.exists() and "/" not in str(cfg.lora_path):
+                lora_dir = ensure_slider_lora(str(cfg.lora_path))
+            if lora_dir and lora_dir.exists():
+                handler.add_lora(str(lora_dir))
+                handler.set_lora_scale(cfg.lora_scale)
+                handler.use_lora = True
+                logger.info(f"LoRA: {lora_dir} at scale {cfg.lora_scale}")
+
+        # Prepare source audio (instrumental) for duration/metas
+        inst_audio, sr_inst = sf_gen.read(str(stems.instrumental))
+        if inst_audio.ndim == 1:
+            inst_audio = np.stack([inst_audio, inst_audio], axis=-1)
+        if sr_inst != 48000:
+            inst_audio = lr.resample(inst_audio.T, orig_sr=sr_inst, target_sr=48000).T
+            sr_inst = 48000
+        target_wavs = torch.tensor(inst_audio.T, dtype=torch.float32).unsqueeze(0)
+        duration = len(inst_audio) / sr_inst
+        metas = [{"audio_duration": duration, "time_signature": "4/4"}]
+        if metadata.get("bpm"):
+            metas[0]["bpm"] = metadata["bpm"]
+        if metadata.get("keyscale"):
+            metas[0]["keyscale"] = metadata["keyscale"]
+
+        # Generate with audio_codes — the handler auto-switches text2music→cover
+        # when codes are provided, but uses 5Hz quantizer path (not 25Hz hints)
+        logger.info(
+            f"Generating with audio_codes (strength={cfg.codes_cover_strength}, "
+            f"guidance={cfg.guidance_scale})..."
+        )
+        _t_gen_start = _time.time()
+        result = handler.service_generate(
+            captions=timeline.caption,
+            lyrics=timeline.lyrics,
+            target_wavs=target_wavs,
+            metas=metas,
+            audio_cover_strength=cfg.codes_cover_strength,
+            guidance_scale=cfg.guidance_scale,
+            infer_steps=cfg.inference_steps,
+            shift=cfg.shift,
+            cover_noise_strength=0.0,  # Start from noise for max creativity
+            audio_code_hints=[codes_string],
+            task_type="text2music",
+            infer_method="ode",
+        )
+        _timings["codes_generation"] = _time.time() - _t_gen_start
+        logger.info(f"⏱️  Codes generation: {_timings['codes_generation']:.1f}s")
+
+        # Decode output
+        gen_dir = Path(f"{output_dir}/generated")
+        gen_dir.mkdir(parents=True, exist_ok=True)
+
+        if "target_latents" in result:
+            latents = result["target_latents"]
+            if latents.shape[-1] == 64:
+                latents = latents.movedim(-1, -2)
+            latents = latents.to(dtype=torch.bfloat16)
+            with torch.no_grad():
+                audio_tensor = handler.tiled_decode(latents)
+            audio_np = audio_tensor.float().cpu().numpy().squeeze()
+            peak = np.max(np.abs(audio_np))
+            if peak > 0:
+                audio_np = audio_np / peak * 0.891
+            out_path = gen_dir / "audio_codes_cover.flac"
+            sf_gen.write(str(out_path), audio_np.T, 48000)
+            instrumental_path = out_path
+            logger.info(f"Audio codes output: {out_path}")
+        else:
+            logger.error("Audio codes generation failed — no latents returned")
+            instrumental_path = None
+
+        # Cleanup
+        del handler
+        import gc as gc_mod
+        gc_mod.collect()
+        torch.cuda.empty_cache()
+
+    elif cfg.generation_mode == "remix_blend":
+        # Remix blend: LM plans creative codes, blend with bass hints, render.
+        # This produces genre-shifted remixes with musical complexity.
+        from .remix_blend import (
+            generate_lm_codes, blend_codes_with_bass,
+            render_with_blended_hints, apply_production_effects,
+        )
+        from .generate_semantic import _load_scrag_vae, ensure_slider_lora
+        from acestep.handler import AceStepHandler
+        import torch
+        import soundfile as sf_gen
+        import numpy as np
+        import librosa as lr
+        import time as _time
+
+        logger.info("Using remix_blend mode (LM creativity + bass chords)")
+
+        # Phase 1: LM generates creative codes
+        _t_lm_start = _time.time()
+        lm_codes = generate_lm_codes(
+            caption=timeline.caption,
+            lyrics=timeline.lyrics,
+            duration=sf_gen.info(str(stems.instrumental)).duration,
+            bpm=metadata.get("bpm", 112),
+            keyscale=metadata.get("keyscale", ""),
+            lm_model=cfg.lm_model,
+            lm_temperature=cfg.lm_temperature,
+        )
+        _timings["lm_codes"] = _time.time() - _t_lm_start
+
+        if not lm_codes:
+            logger.error("LM code generation failed")
+            instrumental_path = None
+        else:
+            # Phase 2: Load DiT, blend, render
+            _t_render_start = _time.time()
+            handler = AceStepHandler()
+            handler.initialize_service(
+                project_root=".", config_path=cfg.dit_model
+            )
+
+            if cfg.use_scrag_vae:
+                _load_scrag_vae(handler)
+
+            # Load LoRA
+            if cfg.lora_path:
+                lora_dir = Path(cfg.lora_path)
+                if not lora_dir.exists() and "/" not in str(cfg.lora_path):
+                    lora_dir = ensure_slider_lora(str(cfg.lora_path))
+                if lora_dir and lora_dir.exists():
+                    handler.add_lora(str(lora_dir))
+                    handler.set_lora_scale(cfg.lora_scale)
+                    handler.use_lora = True
+                    logger.info(f"LoRA: {lora_dir} at scale {cfg.lora_scale}")
+
+            # Blend LM codes with bass hints
+            blended_hints = blend_codes_with_bass(
+                handler=handler,
+                lm_codes=lm_codes,
+                bass_path=str(stems.bass),
+                alpha=cfg.blend_alpha,
+            )
+
+            # Prepare source audio
+            inst_audio, sr_inst = sf_gen.read(str(stems.instrumental))
+            if inst_audio.ndim == 1:
+                inst_audio = np.stack([inst_audio, inst_audio], axis=-1)
+            if sr_inst != 48000:
+                inst_audio = lr.resample(
+                    inst_audio.T, orig_sr=sr_inst, target_sr=48000
+                ).T
+            target_wavs = torch.tensor(
+                inst_audio.T, dtype=torch.float32
+            ).unsqueeze(0)
+            duration = len(inst_audio) / 48000
+            metas = [{"audio_duration": duration, "time_signature": "4/4"}]
+            if metadata.get("bpm"):
+                metas[0]["bpm"] = metadata["bpm"]
+            if metadata.get("keyscale"):
+                metas[0]["keyscale"] = metadata["keyscale"]
+
+            # Render
+            audio_np = render_with_blended_hints(
+                handler=handler,
+                blended_hints=blended_hints,
+                target_wavs=target_wavs,
+                caption=timeline.caption,
+                lyrics=timeline.lyrics,
+                metas=metas,
+                cover_noise_strength=cfg.cover_noise_strength,
+                inference_steps=cfg.inference_steps,
+                shift=cfg.shift,
+            )
+            _timings["render"] = _time.time() - _t_render_start
+
+            if audio_np is not None:
+                gen_dir = Path(f"{output_dir}/generated")
+                gen_dir.mkdir(parents=True, exist_ok=True)
+
+                # Apply effects if enabled
+                if cfg.apply_effects:
+                    audio_np = apply_production_effects(audio_np)
+                    logger.info("Production effects applied")
+
+                out_path = gen_dir / "remix_blend.flac"
+                sf_gen.write(str(out_path), audio_np, 48000)
+                instrumental_path = out_path
+                logger.info(f"Remix blend output: {out_path}")
+
+                # QC + Hint Repaint for failing sections
+                if cfg.max_repaint_attempts > 0:
+                    from .post_gen_qc import (
+                        analyze_generated_audio, get_failing_sections,
+                    )
+                    from .hint_repaint import repaint_section_with_hints
+                    from .semantic_cover import extract_semantic_hints
+
+                    logger.info("QC: checking sections for chord accuracy...")
+                    qc_results = analyze_generated_audio(
+                        audio_path=str(out_path),
+                        bpm=metadata.get("bpm", 100),
+                        key=metadata.get("keyscale", ""),
+                        segments=timeline.segments,
+                        original_audio_path=str(stems.instrumental),
+                    )
+                    failing = get_failing_sections(qc_results)
+
+                    if failing:
+                        logger.info(
+                            f"QC: {len(failing)} sections need repaint"
+                        )
+                        # Use blended hints at lower alpha for repaint
+                        # (more bass = better chords, still some LM character)
+                        repaint_alpha = max(0.15, cfg.blend_alpha - 0.2)
+                        bass_hints_pure = extract_semantic_hints(
+                            handler, str(stems.bass)
+                        )
+                        # Re-decode LM codes for repaint blend
+                        lm_hints_repaint = handler._decode_audio_codes_to_latents(
+                            lm_codes
+                        )
+                        if lm_hints_repaint is not None:
+                            max_t_r = max(
+                                bass_hints_pure.shape[1],
+                                lm_hints_repaint.shape[1],
+                            )
+                            if bass_hints_pure.shape[1] < max_t_r:
+                                bass_hints_pure = torch.cat([
+                                    bass_hints_pure,
+                                    torch.zeros(1, max_t_r - bass_hints_pure.shape[1], 64, device=bass_hints_pure.device, dtype=bass_hints_pure.dtype),
+                                ], dim=1)
+                            if lm_hints_repaint.shape[1] < max_t_r:
+                                lm_hints_repaint = torch.cat([
+                                    lm_hints_repaint,
+                                    torch.zeros(1, max_t_r - lm_hints_repaint.shape[1], 64, device=lm_hints_repaint.device, dtype=lm_hints_repaint.dtype),
+                                ], dim=1)
+                            repaint_hints = (
+                                repaint_alpha * lm_hints_repaint
+                                + (1.0 - repaint_alpha) * bass_hints_pure
+                            )
+                        else:
+                            repaint_hints = bass_hints_pure
+
+                        logger.info(
+                            f"Repaint blend alpha={repaint_alpha:.2f}"
+                        )
+
+                        current_path = str(out_path)
+                        for section in failing:
+                            for attempt in range(cfg.max_repaint_attempts):
+                                logger.info(
+                                    f"  Repainting [{section.label}] "
+                                    f"{section.start_sec:.1f}-"
+                                    f"{section.end_sec:.1f}s "
+                                    f"(attempt {attempt+1})"
+                                )
+                                fixed = repaint_section_with_hints(
+                                    handler=handler,
+                                    creative_audio_path=current_path,
+                                    start_sec=section.start_sec,
+                                    end_sec=section.end_sec,
+                                    hints=repaint_hints,
+                                    caption=timeline.caption,
+                                    lyrics=timeline.lyrics,
+                                    bpm=metadata.get("bpm"),
+                                    keyscale=metadata.get("keyscale"),
+                                    guidance_scale=1.0,
+                                    inference_steps=cfg.inference_steps,
+                                    shift=cfg.shift,
+                                    cover_noise_strength=0.20,
+                                )
+                                if fixed is not None:
+                                    fixed_path = gen_dir / "remix_blend_fixed.flac"
+                                    sf_gen.write(
+                                        str(fixed_path), fixed, 48000
+                                    )
+                                    current_path = str(fixed_path)
+                                    instrumental_path = fixed_path
+                                    logger.info(f"  ✅ Section repainted")
+                                    break
+                                else:
+                                    logger.warning(
+                                        f"  ❌ Repaint attempt {attempt+1} failed"
+                                    )
+                    else:
+                        logger.info("QC: all sections pass ✅")
+
+            else:
+                instrumental_path = None
+
+            # Cleanup
+            del handler
+            import gc as gc_mod
+            gc_mod.collect()
+            torch.cuda.empty_cache()
+
+    elif cfg.generation_mode == "lego_stems":
+        # Lego stem replacement: keep original drums + bass, generate new
+        # melodic track using Lego task. The model hears drums+bass as context
+        # and generates a complementary track in the requested style.
+        from .lego_generate import _mix_stems_to_context, generate_lego_stem
+        from .generate_semantic import _load_scrag_vae, ensure_slider_lora
+        from acestep.handler import AceStepHandler
+        import torch
+        import soundfile as sf_gen
+        import numpy as np
+        import librosa as lr
+        import time as _time
+
+        logger.info("Using lego_stems mode (replace melodic, keep drums+bass)")
+
+        handler = AceStepHandler()
+        handler.initialize_service(project_root=".", config_path=cfg.dit_model)
+
+        if cfg.use_scrag_vae:
+            _load_scrag_vae(handler)
+
+        # Load LoRA
+        if cfg.lora_path:
+            lora_dir = Path(cfg.lora_path)
+            if not lora_dir.exists() and "/" not in str(cfg.lora_path):
+                lora_dir = ensure_slider_lora(str(cfg.lora_path))
+            if lora_dir and lora_dir.exists():
+                handler.add_lora(str(lora_dir))
+                handler.set_lora_scale(cfg.lora_scale)
+                handler.use_lora = True
+                logger.info(f"LoRA: {lora_dir} at scale {cfg.lora_scale}")
+
+        # Mix drums + bass as context for Lego
+        _t_lego_start = _time.time()
+        context_audio = _mix_stems_to_context(stems.drums, stems.bass)
+        duration = len(context_audio) / 48000
+
+        # Generate the melodic/lead track
+        lego_caption = timeline.caption if timeline.caption else (
+            "expressive synth lead with dynamic range"
+        )
+        logger.info(f"Lego caption: {lego_caption[:100]}")
+
+        new_melodic = generate_lego_stem(
+            handler=handler,
+            context_audio=context_audio,
+            track_name="synth",
+            caption=lego_caption,
+            duration=duration,
+            segments=timeline.segments,
+            lyrics=timeline.lyrics,
+            global_caption=timeline.original_caption or lego_caption,
+            bpm=metadata.get("bpm"),
+            keyscale=metadata.get("keyscale"),
+            guidance_scale=cfg.guidance_scale,
+            inference_steps=cfg.inference_steps,
+            shift=cfg.shift,
+        )
+        _timings["lego_generation"] = _time.time() - _t_lego_start
+        logger.info(f"⏱️  Lego generation: {_timings['lego_generation']:.1f}s")
+
+        if new_melodic is not None:
+            # Mix: original drums + original bass + new melodic
+            drums_audio, _ = lr.load(str(stems.drums), sr=48000, mono=False)
+            bass_audio, _ = lr.load(str(stems.bass), sr=48000, mono=False)
+
+            if drums_audio.ndim == 1:
+                drums_audio = np.stack([drums_audio, drums_audio])
+            if bass_audio.ndim == 1:
+                bass_audio = np.stack([bass_audio, bass_audio])
+
+            new_melodic_t = new_melodic.T  # (2, samples)
+
+            # Match lengths
+            min_len = min(
+                drums_audio.shape[1], bass_audio.shape[1], new_melodic_t.shape[1]
+            )
+            drums_audio = drums_audio[:, :min_len]
+            bass_audio = bass_audio[:, :min_len]
+            new_melodic_t = new_melodic_t[:, :min_len]
+
+            # Mix with relative levels (drums loud, bass mid, melodic mid)
+            mixed = drums_audio * 0.9 + bass_audio * 0.7 + new_melodic_t * 0.8
+            peak = np.max(np.abs(mixed))
+            if peak > 0:
+                mixed = mixed / peak * 0.891
+
+            gen_dir = Path(f"{output_dir}/generated")
+            gen_dir.mkdir(parents=True, exist_ok=True)
+            out_path = gen_dir / "lego_remix.flac"
+            sf_gen.write(str(out_path), mixed.T, 48000)
+            instrumental_path = out_path
+            logger.info(f"Lego remix: {out_path}")
+        else:
+            logger.error("Lego generation failed")
+            instrumental_path = None
+
+        # Cleanup
+        del handler
+        import gc as gc_mod
+        gc_mod.collect()
+        torch.cuda.empty_cache()
+
+    elif cfg.generation_mode == "complete_vocals":
+        # Complete task: feed vocals, let model generate full backing freely.
+        # No hints, no cover mode — maximum creative freedom.
+        # The model hears vocals and generates complementary accompaniment.
+        from .generate_semantic import _load_scrag_vae, ensure_slider_lora
+        from acestep.handler import AceStepHandler
+        import torch
+        import soundfile as sf_gen
+        import numpy as np
+        import time as _time
+
+        logger.info("Using complete_vocals mode (vocals → full backing, no hints)")
+
+        handler = AceStepHandler()
+        handler.initialize_service(project_root=".", config_path=cfg.dit_model)
+
+        if cfg.use_scrag_vae:
+            _load_scrag_vae(handler)
+
+        # Load LoRA
+        if cfg.lora_path:
+            lora_dir = Path(cfg.lora_path)
+            if not lora_dir.exists() and "/" not in str(cfg.lora_path):
+                lora_dir = ensure_slider_lora(str(cfg.lora_path))
+            if lora_dir and lora_dir.exists():
+                handler.add_lora(str(lora_dir))
+                handler.set_lora_scale(cfg.lora_scale)
+                handler.use_lora = True
+                logger.info(f"LoRA: {lora_dir} at scale {cfg.lora_scale}")
+
+        # Load vocals as source audio
+        vocal_audio, sr_voc = sf_gen.read(str(stems.vocals))
+        if vocal_audio.ndim == 1:
+            vocal_audio = np.stack([vocal_audio, vocal_audio], axis=-1)
+        if sr_voc != 48000:
+            import librosa as lr
+            vocal_audio = lr.resample(
+                vocal_audio.T, orig_sr=sr_voc, target_sr=48000
+            ).T
+            sr_voc = 48000
+        target_wavs = torch.tensor(
+            vocal_audio.T, dtype=torch.float32
+        ).unsqueeze(0)
+        duration = len(vocal_audio) / sr_voc
+
+        metas = [{"audio_duration": duration, "time_signature": "4/4"}]
+        if metadata.get("bpm"):
+            metas[0]["bpm"] = metadata["bpm"]
+        if metadata.get("keyscale"):
+            metas[0]["keyscale"] = metadata["keyscale"]
+
+        # Build instruction for complete task
+        instruction = "Complete the input track with drums, bass, synth:"
+
+        logger.info(
+            f"Generating complete backing ({duration:.0f}s, "
+            f"bpm={metadata.get('bpm')}, key={metadata.get('keyscale')})"
+        )
+        logger.info(f"Caption: {timeline.caption[:100]}")
+        logger.info(f"Lyrics: {timeline.lyrics[:200]}")
+
+        _t_gen_start = _time.time()
+        result = handler.service_generate(
+            captions=timeline.caption,
+            lyrics=timeline.lyrics,
+            target_wavs=target_wavs,
+            metas=metas,
+            instructions=[instruction],
+            guidance_scale=cfg.guidance_scale,
+            infer_steps=cfg.inference_steps,
+            shift=cfg.shift,
+            task_type="complete",
+            infer_method="ode",
+        )
+        _timings["complete_generation"] = _time.time() - _t_gen_start
+        logger.info(f"⏱️  Complete generation: {_timings['complete_generation']:.1f}s")
+
+        # Decode output
+        gen_dir = Path(f"{output_dir}/generated")
+        gen_dir.mkdir(parents=True, exist_ok=True)
+
+        if "target_latents" in result:
+            latents = result["target_latents"]
+            if latents.shape[-1] == 64:
+                latents = latents.movedim(-1, -2)
+            latents = latents.to(dtype=torch.bfloat16)
+            with torch.no_grad():
+                audio_tensor = handler.tiled_decode(latents)
+            audio_np = audio_tensor.float().cpu().numpy().squeeze()
+            peak = np.max(np.abs(audio_np))
+            if peak > 0:
+                audio_np = audio_np / peak * 0.891
+            out_path = gen_dir / "complete_backing.flac"
+            sf_gen.write(str(out_path), audio_np.T, 48000)
+            instrumental_path = out_path
+            logger.info(f"Complete backing: {out_path}")
+        else:
+            logger.error("Complete generation failed — no latents returned")
+            instrumental_path = None
+
+        # Cleanup
+        del handler
+        import gc as gc_mod
+        gc_mod.collect()
+        torch.cuda.empty_cache()
+
+    elif cfg.generation_mode == "text2music_free":
+        # Pure text2music: no cover conditioning, no hints, no source audio.
+        # The model generates freely from caption + BPM + key + lyrics.
+        # The rearranged caption specifies different instruments — the model
+        # actually uses them because there's no timbre-locked hints overriding.
+        from acestep.handler import AceStepHandler
+        from .generate_semantic import _load_scrag_vae, ensure_slider_lora
+        import torch
+        import soundfile as sf_gen
+        import numpy as np
+        import librosa as lr
+        import time as _time
+
+        logger.info("Using text2music_free mode (no cover conditioning)")
+
+        handler = AceStepHandler()
+        handler.initialize_service(project_root=".", config_path=cfg.dit_model)
+
+        if cfg.use_scrag_vae:
+            _load_scrag_vae(handler)
+
+        # Load LoRA
+        if cfg.lora_path:
+            lora_dir = Path(cfg.lora_path)
+            if not lora_dir.exists() and "/" not in str(cfg.lora_path):
+                lora_dir = ensure_slider_lora(str(cfg.lora_path))
+            if lora_dir and lora_dir.exists():
+                handler.add_lora(str(lora_dir))
+                handler.set_lora_scale(cfg.lora_scale)
+                handler.use_lora = True
+                logger.info(f"LoRA: {lora_dir} at scale {cfg.lora_scale}")
+
+        # Get duration from instrumental stem
+        inst_audio, sr_inst = sf_gen.read(str(stems.instrumental))
+        duration = len(inst_audio) / sr_inst
+
+        # Build metadata — BPM + key anchor the generation harmonically
+        metas = [{"audio_duration": duration, "time_signature": "4/4"}]
+        if metadata.get("bpm"):
+            metas[0]["bpm"] = metadata["bpm"]
+        if metadata.get("keyscale"):
+            metas[0]["keyscale"] = metadata["keyscale"]
+
+        # Generate — pure text2music, no target_wavs, no cover mode
+        logger.info(
+            f"Generating text2music (duration={duration:.1f}s, "
+            f"bpm={metadata.get('bpm')}, key={metadata.get('keyscale')}, "
+            f"guidance={cfg.guidance_scale})..."
+        )
+        _t_gen_start = _time.time()
+        result = handler.service_generate(
+            captions=timeline.caption,
+            lyrics=timeline.lyrics,
+            metas=metas,
+            guidance_scale=cfg.guidance_scale,
+            infer_steps=cfg.inference_steps,
+            shift=cfg.shift,
+            task_type="text2music",
+            infer_method="ode",
+        )
+        _timings["text2music_generation"] = _time.time() - _t_gen_start
+        logger.info(f"⏱️  Text2music generation: {_timings['text2music_generation']:.1f}s")
+
+        # Decode output
+        gen_dir = Path(f"{output_dir}/generated")
+        gen_dir.mkdir(parents=True, exist_ok=True)
+
+        if "target_latents" in result:
+            latents = result["target_latents"]
+            if latents.shape[-1] == 64:
+                latents = latents.movedim(-1, -2)
+            latents = latents.to(dtype=torch.bfloat16)
+            with torch.no_grad():
+                audio_tensor = handler.tiled_decode(latents)
+            audio_np = audio_tensor.float().cpu().numpy().squeeze()
+            peak = np.max(np.abs(audio_np))
+            if peak > 0:
+                audio_np = audio_np / peak * 0.891
+            out_path = gen_dir / "text2music_free.flac"
+            sf_gen.write(str(out_path), audio_np.T, 48000)
+            instrumental_path = out_path
+            logger.info(f"Text2music output: {out_path}")
+        else:
+            logger.error("Text2music generation failed — no latents returned")
+            instrumental_path = None
+
+        # Cleanup
+        del handler
+        import gc as gc_mod
+        gc_mod.collect()
+        torch.cuda.empty_cache()
+
+    elif cfg.generation_mode == "cover_genre":
+        # Cover-mode genre shift: cover task + genre caption + native repaint.
+        # Cover mode naturally follows chords from source audio.
+        # Genre shift comes from the LM-refined caption.
+        # Native repaint fixes sections that drift.
+        from .cover_genre import (
+            refine_caption_for_genre, generate_cover_genre,
+            repaint_failing_sections,
+        )
+        from .generate_semantic import _load_scrag_vae, ensure_slider_lora
+        from acestep.handler import AceStepHandler
+        import torch
+        import soundfile as sf_gen
+        import numpy as np
+        import time as _time
+
+        logger.info("Using cover_genre mode (cover task + genre caption + repaint)")
+
+        # Phase 1: LM enhances genre caption
+        refined_caption = timeline.caption
+        if cfg.refine_caption_lm:
+            _t_lm_start = _time.time()
+            refined_caption = refine_caption_for_genre(
+                caption=timeline.caption,
+                lyrics=timeline.lyrics,
+                bpm=metadata.get("bpm", 112),
+                keyscale=metadata.get("keyscale", ""),
+                duration=sf_gen.info(str(stems.instrumental)).duration,
+                lm_model=cfg.lm_model,
+                lm_temperature=cfg.lm_temperature,
+            )
+            _timings["lm_caption"] = _time.time() - _t_lm_start
+            logger.info(f"⏱️  LM caption: {_timings['lm_caption']:.1f}s")
+
+        # Phase 2: Load DiT and generate cover
+        _t_render_start = _time.time()
+        handler = AceStepHandler()
+        handler.initialize_service(project_root=".", config_path=cfg.dit_model)
+
+        if cfg.use_scrag_vae:
+            _load_scrag_vae(handler)
+
+        # Load LoRA
+        if cfg.lora_path:
+            lora_dir = Path(cfg.lora_path)
+            if not lora_dir.exists() and "/" not in str(cfg.lora_path):
+                lora_dir = ensure_slider_lora(str(cfg.lora_path))
+            if lora_dir and lora_dir.exists():
+                handler.add_lora(str(lora_dir))
+                handler.set_lora_scale(cfg.lora_scale)
+                handler.use_lora = True
+                logger.info(f"LoRA: {lora_dir} at scale {cfg.lora_scale}")
+
+        # Source audio: full instrumental (structural skeleton for cover mode)
+        source_path = str(stems.instrumental)
+        logger.info(f"Source: {source_path} (full instrumental = structural skeleton)")
+
+        # Timbre reference: generate a short clip in the target genre
+        # This tells the model what timbre/style to aim for
+        refer_audios = None
+        if cfg.use_timbre_reference:
+            from .timbre_reference import generate_timbre_reference
+
+            logger.info("Generating timbre reference clip...")
+            _t_ref_start = _time.time()
+            ref_audio = generate_timbre_reference(
+                handler=handler,
+                caption=refined_caption,
+                duration=sf_gen.info(str(stems.instrumental)).duration,
+                lyrics=timeline.lyrics,
+                bpm=metadata.get("bpm"),
+                keyscale=metadata.get("keyscale"),
+                guidance_scale=cfg.guidance_scale,
+                inference_steps=cfg.inference_steps,
+                shift=cfg.shift,
+            )
+            if ref_audio is not None:
+                refer_audios = [[ref_audio]]
+                _timings["timbre_reference"] = _time.time() - _t_ref_start
+                logger.info(
+                    f"⏱️  Timbre reference: {_timings['timbre_reference']:.1f}s"
+                )
+            else:
+                logger.warning("Timbre reference failed — caption-only timbre")
+
+        audio_np = generate_cover_genre(
+            handler=handler,
+            source_audio_path=source_path,
+            caption=refined_caption,
+            lyrics=timeline.lyrics,
+            bpm=metadata.get("bpm"),
+            keyscale=metadata.get("keyscale"),
+            audio_cover_strength=cfg.audio_cover_strength,
+            cover_noise_strength=cfg.cover_noise_strength,
+            guidance_scale=cfg.guidance_scale,
+            inference_steps=cfg.inference_steps,
+            shift=cfg.shift,
+            refer_audios=refer_audios,
+        )
+        _timings["cover_render"] = _time.time() - _t_render_start
+        logger.info(f"⏱️  Cover render: {_timings['cover_render']:.1f}s")
+
+        if audio_np is not None:
+            gen_dir = Path(f"{output_dir}/generated")
+            gen_dir.mkdir(parents=True, exist_ok=True)
+            out_path = gen_dir / "cover_genre.flac"
+            sf_gen.write(str(out_path), audio_np, 48000)
+            instrumental_path = out_path
+            logger.info(f"Cover genre output: {out_path}")
+
+            # Phase 3: QC + native repaint for failing sections
+            if cfg.max_repaint_attempts > 0:
+                from .post_gen_qc import (
+                    analyze_generated_audio, get_failing_sections,
+                )
+
+                logger.info("QC: checking sections...")
+                qc_results = analyze_generated_audio(
+                    audio_path=str(out_path),
+                    bpm=metadata.get("bpm", 100),
+                    key=metadata.get("keyscale", ""),
+                    segments=timeline.segments,
+                    original_audio_path=str(stems.instrumental),
+                )
+                failing = get_failing_sections(qc_results)
+
+                if failing:
+                    logger.info(f"QC: {len(failing)} sections need repaint")
+                    fixed_path = repaint_failing_sections(
+                        handler=handler,
+                        audio_path=str(out_path),
+                        failing_sections=failing,
+                        caption=refined_caption,
+                        lyrics=timeline.lyrics,
+                        source_audio_path=source_path,
+                        bpm=metadata.get("bpm"),
+                        keyscale=metadata.get("keyscale"),
+                        cover_noise_strength=cfg.cover_noise_strength,
+                        guidance_scale=cfg.guidance_scale,
+                        inference_steps=cfg.inference_steps,
+                        shift=cfg.shift,
+                        max_attempts=cfg.max_repaint_attempts,
+                    )
+                    if fixed_path and fixed_path != str(out_path):
+                        instrumental_path = Path(fixed_path)
+                        logger.info(f"Repainted output: {fixed_path}")
+                else:
+                    logger.info("QC: all sections pass ✅")
+        else:
+            instrumental_path = None
+
+        # Cleanup
+        del handler
+        import gc as gc_mod
+        gc_mod.collect()
+        torch.cuda.empty_cache()
+
+    elif cfg.generation_mode == "complete_remix":
+        # Complete-task remix: vocal+bass → complete task generates new instruments.
+        # Pro remixer approach: model hears vocal+bass, generates complementary parts
+        # in the target genre. Chord accuracy is natural (model harmonizes with what
+        # it hears). Creativity comes from the LM-refined caption.
+        from .complete_remix import (
+            refine_caption_with_lm, mix_vocal_and_bass,
+            build_complete_instruction, generate_complete_remix,
+        )
+        from .generate_semantic import _load_scrag_vae, ensure_slider_lora
+        from .rearrangement import parse_instruments_from_caption
+        from acestep.handler import AceStepHandler
+        import torch
+        import soundfile as sf_gen
+        import numpy as np
+        import time as _time
+
+        logger.info("Using complete_remix mode (vocal+bass → complete task)")
+
+        # Phase 1: LM refines caption for complexity/creativity
+        refined_caption = timeline.caption
+        if cfg.refine_caption_lm:
+            _t_lm_start = _time.time()
+            refined_caption = refine_caption_with_lm(
+                caption=timeline.caption,
+                lyrics=timeline.lyrics,
+                bpm=metadata.get("bpm", 112),
+                keyscale=metadata.get("keyscale", ""),
+                duration=sf_gen.info(str(stems.instrumental)).duration,
+                lm_model=cfg.lm_model,
+                lm_temperature=cfg.lm_temperature,
+            )
+            _timings["lm_caption_refine"] = _time.time() - _t_lm_start
+            logger.info(f"⏱️  LM caption refinement: {_timings['lm_caption_refine']:.1f}s")
+
+        # Phase 2: Mix vocal + bass as source audio
+        _t_mix_start = _time.time()
+        if cfg.include_vocal_in_source:
+            source_mix = mix_vocal_and_bass(
+                vocal_path=str(stems.vocals),
+                bass_path=str(stems.bass),
+                bass_level_db=cfg.bass_mix_db,
+            )
+        else:
+            # Bass only — model generates full-energy instruments without
+            # ducking for the vocal. Vocal gets mixed in later by the DAW step.
+            import librosa as lr
+            bass_audio, sr_b = sf_gen.read(str(stems.bass))
+            if bass_audio.ndim == 1:
+                bass_audio = np.stack([bass_audio, bass_audio], axis=-1)
+            if sr_b != 48000:
+                bass_audio = lr.resample(bass_audio.T, orig_sr=sr_b, target_sr=48000).T
+            peak = np.max(np.abs(bass_audio))
+            if peak > 0:
+                bass_audio = bass_audio / peak * 0.891
+            source_mix = bass_audio
+            logger.info(f"Bass-only source: {len(source_mix) / 48000:.1f}s")
+        _timings["source_mix"] = _time.time() - _t_mix_start
+
+        # Phase 3: Build instruction from genre instruments
+        # Parse instruments from the rearrangement caption
+        from .rearrangement import sanitize_rearrangement
+        raw_instruments = parse_instruments_from_caption(timeline.caption)
+        # Use the validated instruments if available
+        if raw_instruments.get("melodic"):
+            instruments = raw_instruments
+        else:
+            instruments = {"drums": "drums", "bass": "bass", "melodic": "synth"}
+        instruction = build_complete_instruction(instruments)
+
+        # Phase 4: Load DiT and generate
+        _t_render_start = _time.time()
+        handler = AceStepHandler()
+        handler.initialize_service(project_root=".", config_path=cfg.dit_model)
+
+        if cfg.use_scrag_vae:
+            _load_scrag_vae(handler)
+
+        # Load LoRA
+        if cfg.lora_path:
+            lora_dir = Path(cfg.lora_path)
+            if not lora_dir.exists() and "/" not in str(cfg.lora_path):
+                lora_dir = ensure_slider_lora(str(cfg.lora_path))
+            if lora_dir and lora_dir.exists():
+                handler.add_lora(str(lora_dir))
+                handler.set_lora_scale(cfg.lora_scale)
+                handler.use_lora = True
+                logger.info(f"LoRA: {lora_dir} at scale {cfg.lora_scale}")
+
+        audio_np = generate_complete_remix(
+            handler=handler,
+            source_mix=source_mix,
+            caption=refined_caption,
+            lyrics=timeline.lyrics,
+            instruction=instruction,
+            bpm=metadata.get("bpm"),
+            keyscale=metadata.get("keyscale"),
+            guidance_scale=cfg.guidance_scale,
+            inference_steps=cfg.inference_steps,
+            shift=cfg.shift,
+        )
+        _timings["complete_render"] = _time.time() - _t_render_start
+        logger.info(f"⏱️  Complete render: {_timings['complete_render']:.1f}s")
+
+        if audio_np is not None:
+            gen_dir = Path(f"{output_dir}/generated")
+            gen_dir.mkdir(parents=True, exist_ok=True)
+            out_path = gen_dir / "complete_remix.flac"
+            sf_gen.write(str(out_path), audio_np, 48000)
+            instrumental_path = out_path
+            logger.info(f"Complete remix output: {out_path}")
+        else:
+            instrumental_path = None
+
+        # Cleanup
+        del handler
+        import gc as gc_mod
+        gc_mod.collect()
+        torch.cuda.empty_cache()
+
     else:
         # CLI subprocess generation (original approach)
         from .generate import run_cover_generation, GenerationConfig
