@@ -101,10 +101,8 @@ def build_variation_morph_controls() -> dict[str, Any]:
                         )
                     with gr.Row():
                         vocal_stem_audio = gr.Audio(
-                            label="Vocal Stem (for harmonic alignment)",
+                            label="Vocal Stem (upload separated vocal for harmonic alignment)",
                             type="filepath",
-                            info="Upload the separated vocal stem. "
-                                 "Its pitch will steer the remix to stay harmonic with the vocals.",
                         )
                     with gr.Row():
                         cdl_guidance_scale = gr.Slider(
