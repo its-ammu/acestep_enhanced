@@ -71,6 +71,8 @@ def generate_with_progress(
     flow_edit_n_min=0.0,
     flow_edit_n_max=1.0,
     flow_edit_n_avg=1,
+    vocal_stem_audio=None,
+    cdl_guidance_scale=0.0,
     progress=gr.Progress(track_tqdm=True),
 ):
     """Generate audio with progress tracking.
@@ -193,6 +195,8 @@ def generate_with_progress(
         flow_edit_n_min=float(flow_edit_n_min) if flow_edit_n_min is not None else 0.0,
         flow_edit_n_max=float(flow_edit_n_max) if flow_edit_n_max is not None else 1.0,
         flow_edit_n_avg=int(flow_edit_n_avg) if flow_edit_n_avg is not None else 1,
+        flow_edit_cdl_guidance_scale=float(cdl_guidance_scale) if cdl_guidance_scale is not None else 0.0,
+        flow_edit_vocal_chroma=_extract_vocal_chroma_safe(vocal_stem_audio, cdl_guidance_scale),
     )
 
     if isinstance(seed, str) and seed.strip():
@@ -485,6 +489,59 @@ def _persist_repaint_source_latents(source_latents, json_path: str, audio_params
         logger.warning("[repaint_cache] Could not persist repaint source latents: {}", exc)
         return
     audio_params["repaint_source_latents_file"] = os.path.basename(latent_path)
+
+
+def _extract_vocal_chroma_safe(vocal_stem_audio_path, cdl_guidance_scale):
+    """Extract vocal chroma from a vocal stem audio file path.
+
+    Surfaces success/failure as Gradio toasts so the user sees extraction
+    status in the browser, not just the server terminal.
+
+    Args:
+        vocal_stem_audio_path: File path string from the Gradio Audio component, or None.
+        cdl_guidance_scale: CDL strength; 0.0 = disabled, skip extraction.
+
+    Returns:
+        Chroma tensor ``[1, T, 12]`` or None.
+    """
+    if not cdl_guidance_scale or float(cdl_guidance_scale) <= 0.0:
+        return None
+    if not vocal_stem_audio_path:
+        # User set CDL scale > 0 but didn't upload a vocal stem — warn them.
+        gr.Warning(
+            "Vocal Harmonic Alignment (CDL) is enabled but no Vocal Stem was uploaded. "
+            "Steering is disabled. Upload the separated vocal stem to activate alignment."
+        )
+        return None
+    try:
+        from acestep.models.common.vocal_f0_extraction import extract_vocal_chroma
+        chroma = extract_vocal_chroma(vocal_stem_audio_path)
+        voiced_frames = int((chroma.sum(dim=-1) > 0).sum().item())
+        total_frames = chroma.shape[1]
+        logger.info(
+            "[generate_with_progress] vocal chroma extracted: shape={}, voiced_frames={}/{}",
+            list(chroma.shape), voiced_frames, total_frames,
+        )
+        gr.Info(
+            f"✅ Vocal Harmonic Alignment active — "
+            f"{voiced_frames}/{total_frames} voiced frames detected in vocal stem."
+        )
+        if voiced_frames == 0:
+            gr.Warning(
+                "Vocal stem has zero voiced frames detected (all unvoiced/silent). "
+                "Check that you uploaded the vocal stem, not the instrumental. "
+                "CDL steering will be a no-op."
+            )
+        return chroma
+    except Exception as exc:
+        logger.warning(
+            "[generate_with_progress] vocal chroma extraction failed (steering disabled): {}", exc
+        )
+        gr.Warning(
+            f"Vocal stem pitch extraction failed — harmonic alignment disabled. "
+            f"Error: {exc}"
+        )
+        return None
 
 
 def _run_auto_lrc(dit_handler, extra_outputs, sample_idx,

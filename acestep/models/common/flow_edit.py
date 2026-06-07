@@ -38,6 +38,7 @@ from tqdm import tqdm
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 
 from .apg_guidance import MomentumBuffer
+from .caph_steering import apply_caph_gradient_steering
 from .flow_edit_helpers import (
     apply_cfg_branch,
     apply_velocity_clamp,
@@ -76,6 +77,9 @@ def flowedit_sampling_loop(
     n_max: float = 1.0,
     n_avg: int = 1,
     use_progress_bar: bool = True,
+    vocal_chroma: Optional[torch.Tensor] = None,
+    cdl_guidance_scale: float = 0.0,
+    caph_aligner: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run the shared flow-edit sampling loop. See module docstring for the
     algorithm.  ``model`` is the DiT variant (must expose ``.decoder(...)``).
@@ -177,6 +181,10 @@ def flowedit_sampling_loop(
             V_tar_avg = apply_velocity_ema(V_tar_sum / n_avg, prev_vt_tar, velocity_ema_factor)
             prev_vt_src, prev_vt_tar = V_src_avg, V_tar_avg
             zt_edit = zt_edit + dt_b * (V_tar_avg - V_src_avg)
+            if cdl_guidance_scale > 0.0 and vocal_chroma is not None and caph_aligner is not None:
+                zt_edit = apply_caph_gradient_steering(
+                    zt_edit, vocal_chroma, caph_aligner, cdl_guidance_scale,
+                )
         else:
             if xt_tar is None:
                 fwd_noise = draw_fwd_noise(src_latents.shape, retake_generators, device, dtype)

@@ -232,6 +232,7 @@ class GenerateMusicMixin:
         flow_edit_n_min: float = 0.0,
         flow_edit_n_max: float = 1.0,
         flow_edit_n_avg: int = 1,
+        flow_edit_cdl_guidance_scale: float = 0.0,
         progress=None,
     ) -> Dict[str, Any]:
         """Generate audio from text/reference inputs and return response payload.
@@ -420,6 +421,7 @@ class GenerateMusicMixin:
                 flow_edit_n_min=flow_edit_n_min,
                 flow_edit_n_max=flow_edit_n_max,
                 flow_edit_n_avg=flow_edit_n_avg,
+                flow_edit_cdl_guidance_scale=flow_edit_cdl_guidance_scale,
             )
             outputs = service_run["outputs"]
             infer_steps_for_progress = service_run["infer_steps_for_progress"]

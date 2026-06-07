@@ -185,6 +185,11 @@ class GenerationParams:
     flow_edit_n_min: float = 0.0
     flow_edit_n_max: float = 1.0
     flow_edit_n_avg: int = 1
+    flow_edit_cdl_guidance_scale: float = 0.0
+    # Pre-computed vocal pitch chroma tensor [1, T, 12] from the separated vocal stem.
+    # Set to None to disable CAPH harmonic steering.  Not serialisable to dict/JSON
+    # but harmless — ``to_dict()`` converts it to None via dataclass asdict().
+    flow_edit_vocal_chroma: Optional[torch.Tensor] = None
     audio_cover_strength: float = 1.0
     cover_noise_strength: float = 0.0  # 0=pure noise (no cover), 1=closest to src audio
 
@@ -861,6 +866,7 @@ def generate_music(
             "flow_edit_n_min": params.flow_edit_n_min,
             "flow_edit_n_max": params.flow_edit_n_max,
             "flow_edit_n_avg": params.flow_edit_n_avg,
+            "flow_edit_cdl_guidance_scale": params.flow_edit_cdl_guidance_scale,
             "instruction": params.instruction,
             "audio_cover_strength": params.audio_cover_strength,
             "cover_noise_strength": params.cover_noise_strength,

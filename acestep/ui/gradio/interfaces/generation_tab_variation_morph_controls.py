@@ -99,6 +99,20 @@ def build_variation_morph_controls() -> dict[str, Any]:
                             minimum=1, maximum=8, value=1, step=1,
                             label="n_avg",
                         )
+                    with gr.Row():
+                        vocal_stem_audio = gr.Audio(
+                            label="Vocal Stem (for harmonic alignment)",
+                            type="filepath",
+                            info="Upload the separated vocal stem. "
+                                 "Its pitch will steer the remix to stay harmonic with the vocals.",
+                        )
+                    with gr.Row():
+                        cdl_guidance_scale = gr.Slider(
+                            minimum=0.0, maximum=2.0, value=0.0, step=0.05,
+                            label="Vocal Harmonic Alignment (CDL)",
+                            info="0=off; 0.1–0.5 subtle; 1.0+ strong. "
+                                 "Requires Vocal Stem above.",
+                        )
         # Visibility chains.
         retake_enabled.change(
             lambda v: gr.update(visible=bool(v)),
@@ -124,4 +138,6 @@ def build_variation_morph_controls() -> dict[str, Any]:
         "flow_edit_n_min": flow_edit_n_min,
         "flow_edit_n_max": flow_edit_n_max,
         "flow_edit_n_avg": flow_edit_n_avg,
+        "vocal_stem_audio": vocal_stem_audio,
+        "cdl_guidance_scale": cdl_guidance_scale,
     }

@@ -53,6 +53,7 @@ class GenerateMusicExecuteMixin:
         flow_edit_n_min: float = 0.0,
         flow_edit_n_max: float = 1.0,
         flow_edit_n_avg: int = 1,
+        flow_edit_cdl_guidance_scale: float = 0.0,
     ) -> Dict[str, Any]:
         """Invoke ``service_generate`` while maintaining background progress estimation.
 
@@ -121,6 +122,7 @@ class GenerateMusicExecuteMixin:
                     flow_edit_n_min=flow_edit_n_min,
                     flow_edit_n_max=flow_edit_n_max,
                     flow_edit_n_avg=flow_edit_n_avg,
+                    flow_edit_cdl_guidance_scale=flow_edit_cdl_guidance_scale,
                 )
             except Exception as exc:
                 _error["exc"] = exc

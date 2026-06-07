@@ -59,6 +59,8 @@ def generate_with_batch_management(
     flow_edit_n_min,
     flow_edit_n_max,
     flow_edit_n_avg,
+    vocal_stem_audio,
+    cdl_guidance_scale,
     autogen_checkbox,
     current_batch_index,
     total_batches,
@@ -96,6 +98,8 @@ def generate_with_batch_management(
         retake_variance, retake_seed,
         flow_edit_morph, flow_edit_source_caption, flow_edit_source_lyrics,
         flow_edit_n_min, flow_edit_n_max, flow_edit_n_avg,
+        vocal_stem_audio,
+        cdl_guidance_scale,
         progress,
     )
 

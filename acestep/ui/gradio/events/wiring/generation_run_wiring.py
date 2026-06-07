@@ -133,6 +133,8 @@ def register_generation_run_handlers(context: GenerationWiringContext) -> None:
             generation_section["flow_edit_n_min"],
             generation_section["flow_edit_n_max"],
             generation_section["flow_edit_n_avg"],
+            generation_section["vocal_stem_audio"],
+            generation_section["cdl_guidance_scale"],
             generation_section["autogen_checkbox"],
             results_section["current_batch_index"],
             results_section["total_batches"],

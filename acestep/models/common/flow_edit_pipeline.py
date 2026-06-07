@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 from loguru import logger
 
+from .caph_steering import maybe_create_caph_aligner
 from .flow_edit import flowedit_sampling_loop
 
 
@@ -117,6 +118,9 @@ def flowedit_generate_audio(
     # text2music callers pass ``silence`` here so V_delta is purely
     # text-driven; defaults to ``src_latents`` for back-compat.
     ctx_src_latents: Optional[torch.Tensor] = None,
+    # CAPH vocal harmonic alignment (CDL guidance)
+    vocal_chroma: Optional[torch.Tensor] = None,
+    cdl_guidance_scale: float = 0.0,
     # Accepted-but-disabled v1 sampler tricks (logged + bypassed)
     sampler_mode: str = "euler",
     use_adg: bool = False,
@@ -166,6 +170,16 @@ def flowedit_generate_audio(
     fwd_seed = retake_seed if retake_seed is not None else seed
     retake_generators = _seed_to_generators(fwd_seed, bsz, src_latents.device)
 
+    # Lazily instantiate CAPHAligner when vocal harmonic steering is requested.
+    # Infers latent_dim from src_latents channel dimension so no config lookup is needed.
+    caph_aligner = maybe_create_caph_aligner(
+        latent_dim=src_latents.shape[-1],
+        vocal_chroma=vocal_chroma,
+        cdl_guidance_scale=cdl_guidance_scale,
+        device=src_latents.device,
+        dtype=src_latents.dtype,
+    )
+
     return flowedit_sampling_loop(
         model,
         src_encoder_hidden_states=src_enc_hs,
@@ -190,4 +204,7 @@ def flowedit_generate_audio(
         n_max=edit_n_max,
         n_avg=edit_n_avg,
         use_progress_bar=use_progress_bar,
+        vocal_chroma=vocal_chroma,
+        cdl_guidance_scale=cdl_guidance_scale,
+        caph_aligner=caph_aligner,
     )

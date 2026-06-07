@@ -65,6 +65,8 @@ class ServiceGenerateMixin:
         flow_edit_n_min: float = 0.0,
         flow_edit_n_max: float = 1.0,
         flow_edit_n_avg: int = 1,
+        flow_edit_cdl_guidance_scale: float = 0.0,
+        flow_edit_vocal_chroma: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Generate music latents and metadata from text/audio conditioning inputs.
 
@@ -152,6 +154,14 @@ class ServiceGenerateMixin:
         # same on both sides). Repaint / extract / lego have task-shape-
         # specific conditioning that needs paired-CFG derivation — left
         # for follow-up.
+        # Expand vocal_chroma from [1, T, 12] to [B, T, 12] if needed so the
+        # batch dim matches src_latents during the sampling loop.
+        expanded_vocal_chroma = flow_edit_vocal_chroma
+        if flow_edit_vocal_chroma is not None and flow_edit_vocal_chroma.shape[0] == 1:
+            bsz_for_expand = len(normalized.get("captions") or [1])
+            if bsz_for_expand > 1:
+                expanded_vocal_chroma = flow_edit_vocal_chroma.expand(bsz_for_expand, -1, -1)
+
         flow_edit_ctx = {
             "morph": flow_edit_morph and task_type in ("text2music", "cover", "cover-nofsq"),
             "task_type": task_type,
@@ -160,6 +170,8 @@ class ServiceGenerateMixin:
             "n_min": flow_edit_n_min,
             "n_max": flow_edit_n_max,
             "n_avg": flow_edit_n_avg,
+            "cdl_guidance_scale": flow_edit_cdl_guidance_scale,
+            "vocal_chroma": expanded_vocal_chroma,
             "vocal_languages": normalized.get("vocal_languages"),
             "metas": normalized.get("metas"),
             "instructions": normalized.get("instructions"),

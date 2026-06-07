@@ -157,6 +157,8 @@ def dispatch_flow_edit_overlay(
                 edit_n_min=n_min,
                 edit_n_max=n_max,
                 edit_n_avg=n_avg,
+                vocal_chroma=flow_edit_ctx.get("vocal_chroma"),
+                cdl_guidance_scale=float(flow_edit_ctx.get("cdl_guidance_scale", 0.0)),
                 precomputed_lm_hints_25Hz=precomputed_lm_hints_arg,
                 # v1-disabled tricks — pipeline logs them and bypasses.
                 sampler_mode=generate_kwargs.get("sampler_mode", "euler"),
